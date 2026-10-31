@@ -10,7 +10,8 @@ Updated: 2026-10-31
 - Documented Windows PowerShell setup and the required Neon credential rotation.
 - Applied the initial migration to Neon and verified Alembic reports `0001_initial (head)`.
 - Confirmed the dashboard starts successfully and the workspace `.env` is ignored by Git.
-- All 6 automated tests pass.
+- Verified the direct Neon connection. The configured pooled URL failed, so the app health check now falls back to the direct URL without exposing connection details.
+- All 7 automated tests pass.
 
 ## Not yet completed
 

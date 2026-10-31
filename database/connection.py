@@ -12,17 +12,19 @@ from sqlalchemy.exc import SQLAlchemyError
 load_dotenv()
 
 
-def _configured_url() -> str | None:
-    return os.getenv("DATABASE_URL_POOLED") or os.getenv("DATABASE_URL")
+def _configured_urls() -> list[str]:
+    """Return pooled-first URLs, with direct connection as a safe fallback."""
+    urls = [os.getenv("DATABASE_URL_POOLED"), os.getenv("DATABASE_URL")]
+    return list(dict.fromkeys(url for url in urls if url))
 
 
 def database_configuration() -> tuple[bool, str]:
     """Return presence/type only; never return the configured URL."""
-    url = _configured_url()
-    if not url:
+    urls = _configured_urls()
+    if not urls:
         return False, "Not configured"
     try:
-        parsed = make_url(url)
+        parsed = make_url(urls[0])
     except Exception:
         return True, "Invalid URL"
     if parsed.drivername.startswith("postgres"):
@@ -41,9 +43,9 @@ def _normalize_url(url: str) -> str:
     return parsed.render_as_string(hide_password=False)
 
 
-@lru_cache(maxsize=1)
-def get_engine() -> Engine:
-    url = _configured_url()
+@lru_cache(maxsize=2)
+def get_engine(url: str | None = None) -> Engine:
+    url = url or next(iter(_configured_urls()), None)
     if not url:
         raise RuntimeError("DATABASE_URL is not configured")
     options: dict[str, object] = {"pool_pre_ping": True}
@@ -54,11 +56,16 @@ def get_engine() -> Engine:
 
 def check_database() -> tuple[bool, str]:
     """Test connectivity without exposing driver messages or connection details."""
-    if not _configured_url():
+    urls = _configured_urls()
+    if not urls:
         return False, "Database is not configured. Set DATABASE_URL in your local .env file."
-    try:
-        with get_engine().connect() as connection:
-            connection.execute(text("SELECT 1"))
-        return True, "Database connection successful."
-    except (SQLAlchemyError, RuntimeError, ValueError):
-        return False, "Database connection failed. Check the local DATABASE_URL and provider status. Details are hidden to protect credentials."
+    for index, url in enumerate(urls):
+        try:
+            with get_engine(url).connect() as connection:
+                connection.execute(text("SELECT 1"))
+            if index:
+                return True, "Database connected through DATABASE_URL; the pooled URL is unavailable. Check DATABASE_URL_POOLED."
+            return True, "Database connection successful."
+        except (SQLAlchemyError, RuntimeError, ValueError):
+            continue
+    return False, "Database connection failed. Check the local DATABASE_URL settings and provider status. Details are hidden to protect credentials."

@@ -6,5 +6,6 @@
 - SQLAlchemy 2.x models and Alembic provide the initial schema. The dashboard checks connectivity but does not run migrations or create tables on page load.
 - Dashboard connection errors are generic. Raw driver exception text and connection URLs are never displayed.
 - PostgreSQL URL schemes are normalized to `postgresql+psycopg`; SSL is required for PostgreSQL connections.
+- App health checks prefer `DATABASE_URL_POOLED` and fall back to `DATABASE_URL` if the pooled endpoint is unavailable. Status text does not expose connection details.
 - Milestone 1 has reference/observation tables only. Strategy, execution, and trading history tables are deferred to their specified milestones.
 - Real-money trading remains disabled and is outside the application surface.
