@@ -1,0 +1,1 @@
+Alembic migrations are stored in `versions/`. Run `alembic upgrade head` from the repository root after setting DATABASE_URL.
