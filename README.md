@@ -49,13 +49,22 @@ pytest
 
 Without a configured database URL, the dashboard still starts and reports that database configuration is missing. No tables are created automatically by opening the dashboard.
 
+## Soccer live scores
+
+- The dashboard uses the existing `JUPITER_API_KEY` and Jupiter's documented `tags=soccer` plus `filter=live` event filters, followed by `GET /events/scores` for scores, status, period, and elapsed time. Select a match to load its market details, including moneyline, first team to score, and both teams to score. Refresh manually from the dashboard.
+- Market prices and volumes use Jupiter's documented fields; displayed $1 payouts are derived from the current buy price before fees. Favorite/long-shot labels are price-derived. The example's `REG TIME` label is not included in Jupiter's market response.
+- Jupiter's documented score response does not include shots, possession, or corners. The existing API-Football adapter can provide those statistics but needs a separate `API_FOOTBALL_KEY`; coverage and rights vary. See [docs/integrations/sports-data.md](docs/integrations/sports-data.md) before enabling it.
+- Fetched observations are shown in the current dashboard session and are not persisted. The app does not create betting signals, place bets, or submit transactions.
+
+The Streamlit sidebar also includes **Engine View**, an alternative layout for the same sourced soccer scores and selected-match market groups. Engine-style status panels report actual data availability only; wallet, RPC, strategy-gate, and trading values are not simulated.
+
 ## Initial schema
 
 Alembic manages the initial tables for events, markets, outcome mappings, market snapshots, and match snapshots. Prices and volumes use fixed-precision numeric columns, timestamps are timezone-aware, and foreign keys/indexes protect relationships and observation queries. This first schema intentionally contains no orders, fills, positions, or strategy signals; those belong to later milestones.
 
 ## Current scope and limitations
 
-- No live market or sports data adapters are connected; no fixture data is presented as live.
+- The dashboard uses Jupiter's read-only soccer event and score APIs. The API-Football read-only adapter remains available for richer statistics if its separate key and data-use rights are configured.
 - No strategy execution or simulated positions are implemented in Milestones 0–1.
 - The dashboard is a health and setup view, not an always-on worker.
 - Neon is intended as authoritative storage. Do not rely on Render's ephemeral filesystem for persistent data or backups.

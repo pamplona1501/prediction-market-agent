@@ -1,0 +1,1 @@
+"""Sports data provider adapters."""

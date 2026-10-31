@@ -1,5 +1,3 @@
-from sqlalchemy.exc import OperationalError
-
 from database.connection import _normalize_url, check_database, database_configuration
 from database.models import Base
 
