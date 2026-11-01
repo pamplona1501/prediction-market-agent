@@ -3,7 +3,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, JSON, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -21,8 +21,36 @@ class Event(Base):
     away_name: Mapped[str | None] = mapped_column(String(160))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     markets: Mapped[list["Market"]] = relationship(back_populates="event")
+    provider_references: Mapped[list["EventProviderReference"]] = relationship(back_populates="event")
 
     __table_args__ = (UniqueConstraint("provider", "provider_event_id", name="uq_events_provider_event"),)
+
+
+class EventProviderReference(Base):
+    """Provider-specific identity attached to one canonical event after source-specific checks."""
+
+    __tablename__ = "event_provider_references"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    event_id: Mapped[str] = mapped_column(ForeignKey("events.id", ondelete="RESTRICT"), nullable=False)
+    provider: Mapped[str] = mapped_column(String(80), nullable=False)
+    provider_event_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    provider_event_name: Mapped[str | None] = mapped_column(String(200))
+    scheduled_start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    mapping_status: Mapped[str] = mapped_column(String(20), nullable=False, default="unverified")
+    mapping_method: Mapped[str | None] = mapped_column(String(40))
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    event: Mapped[Event] = relationship(back_populates="provider_references")
+
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_event_id", name="uq_event_provider_reference"),
+        CheckConstraint(
+            "mapping_status IN ('unverified', 'verified', 'rejected')",
+            name="ck_event_provider_reference_status",
+        ),
+        Index("ix_event_provider_references_event_provider", "event_id", "provider"),
+    )
 
 
 class Market(Base):
@@ -64,10 +92,12 @@ class MarketSnapshot(Base):
     market_id: Mapped[str] = mapped_column(ForeignKey("markets.id", ondelete="RESTRICT"), nullable=False)
     outcome_key: Mapped[str] = mapped_column(String(20), nullable=False)
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    snapshot_phase: Mapped[str] = mapped_column(String(20), nullable=False, default="live")
     bid: Mapped[Decimal | None] = mapped_column(Numeric(12, 8))
     ask: Mapped[Decimal | None] = mapped_column(Numeric(12, 8))
     executable_depth_usd: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
     event_volume_usd: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    market_volume_usd: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
     volume_source: Mapped[str | None] = mapped_column(String(160))
     source: Mapped[str] = mapped_column(String(100), nullable=False)
     payload_note: Mapped[str | None] = mapped_column(Text)
@@ -76,6 +106,33 @@ class MarketSnapshot(Base):
         CheckConstraint("bid IS NULL OR (bid > 0 AND bid <= 1)", name="ck_market_snapshot_bid_probability"),
         CheckConstraint("ask IS NULL OR (ask > 0 AND ask <= 1)", name="ck_market_snapshot_ask_probability"),
         Index("ix_market_snapshots_market_observed", "market_id", "observed_at"),
+        CheckConstraint("snapshot_phase IN ('prematch', 'live')", name="ck_market_snapshot_phase"),
+    )
+
+
+class StrategyEvaluation(Base):
+    """Append-only audit of triggered candidate and rejection evaluations."""
+
+    __tablename__ = "strategy_evaluations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    event_id: Mapped[str] = mapped_column(ForeignKey("events.id", ondelete="RESTRICT"), nullable=False)
+    market_id: Mapped[str | None] = mapped_column(ForeignKey("markets.id", ondelete="RESTRICT"))
+    strategy_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    strategy_version: Mapped[str] = mapped_column(String(30), nullable=False)
+    outcome_key: Mapped[str] = mapped_column(String(20), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    gate_results: Mapped[dict[str, bool]] = mapped_column(JSON, nullable=False)
+    reasons: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    input_snapshot: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    configuration_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    dedupe_key: Mapped[str | None] = mapped_column(String(300), unique=True)
+
+    __table_args__ = (
+        Index("ix_strategy_evaluations_event_time", "event_id", "evaluated_at"),
+        CheckConstraint("status IN ('candidate', 'rejected')", name="ck_strategy_evaluations_status"),
+        CheckConstraint("outcome_key IN ('HOME', 'DRAW', 'AWAY')", name="ck_strategy_evaluations_outcome"),
     )
 
 
@@ -91,8 +148,22 @@ class MatchSnapshot(Base):
     away_score: Mapped[int | None] = mapped_column()
     home_shots: Mapped[int | None] = mapped_column()
     away_shots: Mapped[int | None] = mapped_column()
+    home_shots_on_target: Mapped[int | None] = mapped_column()
+    away_shots_on_target: Mapped[int | None] = mapped_column()
     home_possession: Mapped[Decimal | None] = mapped_column(Numeric(6, 3))
     away_possession: Mapped[Decimal | None] = mapped_column(Numeric(6, 3))
+    home_passes: Mapped[int | None] = mapped_column()
+    away_passes: Mapped[int | None] = mapped_column()
+    home_pass_accuracy: Mapped[Decimal | None] = mapped_column(Numeric(6, 3))
+    away_pass_accuracy: Mapped[Decimal | None] = mapped_column(Numeric(6, 3))
+    home_fouls: Mapped[int | None] = mapped_column()
+    away_fouls: Mapped[int | None] = mapped_column()
+    home_yellow_cards: Mapped[int | None] = mapped_column()
+    away_yellow_cards: Mapped[int | None] = mapped_column()
+    home_red_cards: Mapped[int | None] = mapped_column()
+    away_red_cards: Mapped[int | None] = mapped_column()
+    home_offsides: Mapped[int | None] = mapped_column()
+    away_offsides: Mapped[int | None] = mapped_column()
     home_corners: Mapped[int | None] = mapped_column()
     away_corners: Mapped[int | None] = mapped_column()
     source: Mapped[str] = mapped_column(String(100), nullable=False)

@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#080d12">
+    <title>Match Monitor · Prediction Market Agent</title>
+    <link rel="stylesheet" href="/assets/styles.css">
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <a class="brand" href="/"><span class="brand-mark">PM</span><span>Prediction Market <b>Agent</b></span></a>
+        <div class="top-status">
+          <span class="live-dot" id="connectionDot"></span>
+          <span id="connectionLabel">Connecting</span>
+          <span class="divider"></span>
+          <span class="execution-pill">READ ONLY <i>·</i> EXECUTION DISABLED</span>
+        </div>
+      </header>
+
+      <main>
+        <section class="hero">
+          <div>
+            <div class="eyebrow">NEAR-LIVE MONITORING <span class="eyebrow-line"></span> SOCCER</div>
+            <h1>Match center</h1>
+            <p class="hero-copy">Jupiter REST refreshes about every 30 seconds while the service is running. Provider scores may still arrive with upstream delay.</p>
+          </div>
+          <div class="service-card">
+            <span class="service-label">Monitor service</span>
+            <span class="service-value" id="serviceStatus">Starting</span>
+            <span class="service-meta" id="pollInterval">Waiting for first provider update</span>
+          </div>
+        </section>
+
+        <div class="notice" id="topNotice" hidden></div>
+
+        <section class="provider-strip" aria-label="Provider health">
+          <article class="provider-card">
+            <div class="provider-icon jupiter-icon">J</div>
+            <div class="provider-copy"><b>Jupiter Prediction API</b><span id="jupiterMeta">Waiting for feed</span></div>
+            <span class="provider-state" id="jupiterStatus">—</span>
+          </article>
+          <article class="provider-card">
+            <div class="provider-icon storage-icon">DB</div>
+            <div class="provider-copy"><b>Snapshot storage</b><span id="storageMeta">Starts when a match is monitored</span></div>
+            <span class="provider-state" id="storageStatus">Idle</span>
+          </article>
+          <article class="provider-card">
+            <div class="provider-icon">⚽</div>
+            <div class="provider-copy"><b>Match statistics · LiveScore MCP</b><span id="statsProviderMeta">Fetched only when requested for the selected match</span></div>
+            <span class="provider-state" id="statsProviderStatus">On demand</span>
+          </article>
+        </section>
+
+        <section class="workspace">
+          <aside class="event-panel panel">
+            <div class="panel-heading">
+              <div><span class="section-kicker">JUPITER · LIVE SOCCER</span><h2>In-play events</h2></div>
+              <span class="count-badge" id="eventCount">0</span>
+            </div>
+            <p class="muted small">🔥 marks Jupiter event volume above US$1M. ⭐ marks a selected match with a strategy candidate passing all eligibility gates.</p>
+            <div class="event-list" id="eventList"><div class="empty-state">Waiting for live events…</div></div>
+            <div class="feed-foot"><span class="pulse"></span><span id="feedUpdated">No provider update yet</span></div>
+          </aside>
+
+          <section class="detail-column">
+            <article class="match-panel panel" id="matchPanel">
+              <div class="empty-match">
+                <div class="empty-icon">⌁</div>
+                <h2>Choose a live match</h2>
+                <p>The event feed refreshes automatically. Select a match to begin its order-book polling and snapshot capture.</p>
+              </div>
+            </article>
+
+            <article class="strategy-panel panel">
+              <div class="panel-heading strategy-heading">
+                <div><span class="section-kicker">CANDIDATE ENGINE</span><h2>Eligibility checks</h2></div>
+                <span class="mode-tag">NO ORDERS</span>
+              </div>
+              <p class="muted small">A candidate is blocked when any required source, mapping, quote, depth, or freshness gate is missing.</p>
+              <div class="gate-grid" id="gateGrid">
+                <div class="gate waiting"><span class="gate-symbol">·</span><span><b>Three-way moneyline</b><small>Waiting for selected match</small></span></div>
+                <div class="gate waiting"><span class="gate-symbol">·</span><span><b>Event volume ≥ $1M</b><small>Source-verified Jupiter volume</small></span></div>
+                <div class="gate waiting"><span class="gate-symbol">·</span><span><b>First-half time ≤ 45′</b><small>Waiting for match clock</small></span></div>
+                <div class="gate waiting"><span class="gate-symbol">·</span><span><b>In-game statistics</b><small>Fetch on demand to verify the selected match</small></span></div>
+                <div class="gate waiting"><span class="gate-symbol">·</span><span><b>Executable order-book depth</b><small>Ask-side depth required</small></span></div>
+                <div class="gate waiting"><span class="gate-symbol">·</span><span><b>Signal generation</b><small>Candidate rules remain disabled until inputs pass</small></span></div>
+              </div>
+              <div class="strategy-note" id="strategyNote">Monitoring only. Strategy candidates are not orders or recommendations.</div>
+              <div class="strategy-results" id="strategyResults"></div>
+            </article>
+
+            <article class="log-panel panel">
+              <div class="panel-heading"><div><span class="section-kicker">SYSTEM TELEMETRY</span><h2>Recent activity</h2></div><span class="log-limit">LAST 100 IN SERVICE</span></div>
+              <div class="log-list" id="logList"><div class="empty-state">Monitor events will appear here.</div></div>
+            </article>
+          </section>
+        </section>
+      </main>
+      <footer><span>Prediction Market Agent · local research mode</span><span>Jupiter prices are indicative; order-book depth is shown where returned.</span></footer>
+    </div>
+    <script type="module" src="/assets/app.js"></script>
+  </body>
+</html>

@@ -7,6 +7,7 @@ from decimal import Decimal, ROUND_HALF_UP
 import streamlit as st
 from dotenv import load_dotenv
 
+from integrations.market_data.capture import capture_selected_event
 from integrations.market_data.jupiter import (
     JupiterDataError,
     JupiterEvent,
@@ -54,9 +55,27 @@ def fetch_live_soccer() -> tuple[JupiterEventPage, tuple[JupiterLiveScore, ...]]
     return events, scores
 
 
-@st.cache_data(ttl=30, show_spinner=False)
-def fetch_event_markets(event_id: str) -> JupiterEvent:
-    return JupiterPredictionClient.from_environment().get_sports_event_details(event_id)
+def capture_engine_selection() -> None:
+    event_id = st.session_state.get("engine_selected_event_id")
+    data = st.session_state.get("engine_soccer_data")
+    if not event_id or not data:
+        return
+    _, scores = data
+    score = next((item for item in scores if item.event_id == event_id), None)
+    try:
+        result = capture_selected_event(event_id, score=score)
+        st.session_state.engine_market_detail = result.event
+        st.session_state.engine_capture_status = (
+            f"Recorded {result.snapshots_written} YES/NO observations." if result.persisted
+            else "Markets loaded, but snapshots were not saved. Check database configuration/schema."
+        )
+        logs = st.session_state.setdefault("engine_event_log", [])
+        logs.insert(0, f"{_now_utc():%H:%M:%S UTC} · {st.session_state.engine_capture_status}")
+    except JupiterDataError as exc:
+        st.session_state.engine_market_detail = None
+        st.session_state.engine_capture_status = f"Market detail request failed: {exc}"
+        logs = st.session_state.setdefault("engine_event_log", [])
+        logs.insert(0, f"{_now_utc():%H:%M:%S UTC} · {st.session_state.engine_capture_status}")
 
 
 def cents(value: Decimal | None) -> str:
@@ -173,7 +192,7 @@ top2.metric("Live events", event_count)
 top3.metric("Score rows", score_count)
 top4.metric("Execution", "Disabled")
 top5.metric("Paper strategy", "Not implemented")
-st.caption("Scores are fetched from Jupiter on demand. No database write or background polling is performed.")
+st.caption("Scores are fetched on demand. Selecting a match captures fresh market snapshots; no background polling runs.")
 st.markdown("---")
 
 if refresh:
@@ -204,12 +223,16 @@ with main:
         else:
             selected = st.selectbox(
                 "Live match",
-                event_page.events,
-                format_func=lambda item: item.title,
-                key="engine_selected_event",
+                [item.event_id for item in event_page.events],
+                format_func=lambda event_id: next(
+                    (item.title for item in event_page.events if item.event_id == event_id), str(event_id)
+                ),
+                key="engine_selected_event_id",
+                on_change=capture_engine_selection,
             )
-            score = score_by_id.get(selected.event_id)
-            event_volume = usd(selected.reported_volume_usd)
+            selected_event = next(item for item in event_page.events if item.event_id == selected)
+            score = score_by_id.get(selected)
+            event_volume = usd(selected_event.reported_volume_usd)
             card1, card2, card3, card4 = st.columns(4)
             card1.metric("Match Time", f"{score.period or '—'} · {score.elapsed or '—'}'" if score else "Unavailable")
             card2.metric("Scoreline", score.score or "—" if score else "Unavailable")
@@ -220,20 +243,15 @@ with main:
                 f"score updated {score.updated_at if score and score.updated_at else 'timestamp unavailable'}"
             )
 
-            if st.button("Load selected match markets"):
-                fetch_event_markets.clear()
-                try:
-                    with st.spinner("Loading the selected event’s market details…"):
-                        st.session_state.engine_market_detail = fetch_event_markets(selected.event_id)
-                    log = st.session_state.setdefault("engine_event_log", [])
-                    log.insert(0, f"{_now_utc():%H:%M:%S UTC} · Loaded {len(st.session_state.engine_market_detail.markets)} market records for selected event.")
-                except JupiterDataError as exc:
-                    st.session_state.engine_market_detail = None
-                    log = st.session_state.setdefault("engine_event_log", [])
-                    log.insert(0, f"{_now_utc():%H:%M:%S UTC} · Market detail request failed: {exc}")
+            if st.button("Refresh markets & record snapshot"):
+                with st.spinner("Loading the selected event’s market details…"):
+                    capture_engine_selection()
+
+            if st.session_state.get("engine_capture_status"):
+                st.caption(st.session_state.engine_capture_status)
 
             detail: JupiterEvent | None = st.session_state.get("engine_market_detail")
-            if detail and detail.event_id == selected.event_id:
+            if detail and detail.event_id == selected:
                 st.markdown("#### Live Contract Pricing")
                 table = market_table(detail, score)
                 if table:

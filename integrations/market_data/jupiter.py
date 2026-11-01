@@ -54,6 +54,7 @@ class JupiterEvent:
     title: str
     category: str | None
     subcategory: str | None
+    scheduled_start_at: datetime | None
     is_live: bool | None
     reported_volume_usd: Decimal | None
     markets: tuple[JupiterMarket, ...]
@@ -75,6 +76,40 @@ class JupiterMarketPage:
     total: int | None
     has_next: bool
     fetched_at: datetime
+
+
+@dataclass(frozen=True)
+class OrderBookLevel:
+    price_usd: Decimal
+    quantity: Decimal
+
+
+@dataclass(frozen=True)
+class JupiterOrderBook:
+    market_id: str
+    yes_bids: tuple[OrderBookLevel, ...]
+    no_bids: tuple[OrderBookLevel, ...]
+    fetched_at: datetime
+
+    @property
+    def yes_asks(self) -> tuple[OrderBookLevel, ...]:
+        return tuple(
+            sorted(
+                (OrderBookLevel(Decimal("1") - level.price_usd, level.quantity)
+                 for level in self.no_bids if level.price_usd < 1),
+                key=lambda level: level.price_usd,
+            )
+        )
+
+    @property
+    def no_asks(self) -> tuple[OrderBookLevel, ...]:
+        return tuple(
+            sorted(
+                (OrderBookLevel(Decimal("1") - level.price_usd, level.quantity)
+                 for level in self.yes_bids if level.price_usd < 1),
+                key=lambda level: level.price_usd,
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -106,6 +141,18 @@ def _reported_usd(value: Any) -> Decimal | None:
         return Decimal(str(value))
     except (InvalidOperation, ValueError, TypeError):
         return None
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _parse_market(item: Any) -> JupiterMarket | None:
@@ -153,10 +200,32 @@ def _parse_event(item: Any) -> JupiterEvent | None:
         title=str(metadata.get("title") or item.get("title") or "Untitled event"),
         category=str(item["category"]) if item.get("category") is not None else None,
         subcategory=str(item["subcategory"]) if item.get("subcategory") is not None else None,
+        scheduled_start_at=_parse_datetime(item.get("beginAt")),
         is_live=is_live,
-        reported_volume_usd=_reported_usd(item.get("volumeUsd")),
+        # Jupiter's events endpoint returns event aggregate volume in micro-USD.
+        # Convert at ingestion so every downstream gate and persisted value uses USD.
+        reported_volume_usd=_micro_usd(item.get("volumeUsd")),
         markets=markets,
     )
+
+
+def _parse_orderbook_levels(values: Any, *, dollars: bool) -> tuple[OrderBookLevel, ...]:
+    if not isinstance(values, list):
+        return ()
+    levels: list[OrderBookLevel] = []
+    for row in values:
+        if not isinstance(row, (list, tuple)) or len(row) < 2:
+            continue
+        try:
+            price = Decimal(str(row[0]))
+            quantity = Decimal(str(row[1]))
+            if not dollars:
+                price /= Decimal("100")
+            if Decimal("0") <= price <= Decimal("1") and quantity > 0:
+                levels.append(OrderBookLevel(price_usd=price, quantity=quantity))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+    return tuple(levels)
 
 
 class JupiterPredictionClient:
@@ -207,7 +276,12 @@ class JupiterPredictionClient:
             raise JupiterDataError("Jupiter returned an unreadable response.") from None
 
     def list_sports_events(
-        self, *, filter_name: str = "live", limit: int = 20, tag: str | None = None
+        self,
+        *,
+        filter_name: str = "live",
+        limit: int = 20,
+        tag: str | None = None,
+        include_markets: bool = False,
     ) -> JupiterEventPage:
         if filter_name not in {"live", "upcoming", "trending"}:
             raise ValueError("Unsupported Jupiter event filter")
@@ -217,7 +291,7 @@ class JupiterPredictionClient:
         params = {
             "category": "sports",
             "filter": filter_name,
-            "includeMarkets": "false",
+            "includeMarkets": "true" if include_markets else "false",
             "start": 0,
             "end": limit,
         }
@@ -293,5 +367,25 @@ class JupiterPredictionClient:
             end=start + page_size,
             total=int(pagination["total"]) if isinstance(pagination.get("total"), int) else None,
             has_next=bool(pagination.get("hasNext", len(markets) == page_size)),
+            fetched_at=datetime.now(UTC),
+        )
+
+    def get_orderbook(self, market_id: str) -> JupiterOrderBook:
+        """Fetch documented binary YES/NO bid depth and derive complement asks."""
+        if not market_id or len(market_id) > 160:
+            raise ValueError("market_id must be a non-empty provider ID")
+        payload = self._get_json(f"orderbook/{quote(market_id, safe='')}", {})
+        if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+            payload = payload["data"]
+        if not isinstance(payload, dict):
+            raise JupiterDataError("Jupiter response did not match the documented orderbook format.")
+        yes_key = "yes_dollars" if isinstance(payload.get("yes_dollars"), list) else "yes"
+        no_key = "no_dollars" if isinstance(payload.get("no_dollars"), list) else "no"
+        if not isinstance(payload.get(yes_key), list) or not isinstance(payload.get(no_key), list):
+            raise JupiterDataError("Jupiter response did not contain YES/NO orderbook levels.")
+        return JupiterOrderBook(
+            market_id=market_id,
+            yes_bids=_parse_orderbook_levels(payload[yes_key], dollars=yes_key.endswith("dollars")),
+            no_bids=_parse_orderbook_levels(payload[no_key], dollars=no_key.endswith("dollars")),
             fetched_at=datetime.now(UTC),
         )

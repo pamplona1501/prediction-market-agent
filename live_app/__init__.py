@@ -1,0 +1,1 @@
+"""FastAPI live-monitor application."""

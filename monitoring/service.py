@@ -1,0 +1,785 @@
+"""Near-live provider polling with bounded WebSocket fan-out."""
+
+from __future__ import annotations
+
+import asyncio
+from collections import deque
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+import os
+import re
+import time
+from typing import Any
+
+from integrations.market_data.capture import persist_event_snapshot, persist_prematch_event, persist_strategy_audit
+from integrations.market_data.jupiter import (
+    JupiterDataError,
+    JupiterEvent,
+    JupiterLiveScore,
+    JupiterMarket,
+    JupiterOrderBook,
+    JupiterPredictionClient,
+)
+from database.connection import get_engine
+from database.provider_mapping import (
+    record_livescore_mcp_statistics,
+    livescore_mcp_mapping_status,
+)
+from database.snapshots import read_prematch_yes_prices
+from sqlalchemy.orm import Session
+from integrations.sports_data.livescore_mcp import LiveScoreMCPClient, LiveScoreMCPError, MatchStatistics
+from strategies.live import AskLevel, CandidateConfig, MarketQuote, MatchInputs, evaluate_live_match
+
+
+def _iso(value: datetime | None) -> str | None:
+    return value.astimezone(UTC).isoformat() if value else None
+
+
+def _decimal(value: Decimal | None) -> str | None:
+    return format(value, "f") if value is not None else None
+
+
+def _minute(value: str | None) -> int | None:
+    match = re.search(r"\d+", value or "")
+    return int(match.group()) if match else None
+
+
+def _parse_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+
+def _levels(levels: tuple[Any, ...]) -> list[dict[str, str]]:
+    return [
+        {"price_usd": _decimal(level.price_usd) or "0", "quantity": _decimal(level.quantity) or "0"}
+        for level in levels
+    ]
+
+
+def orderbook_view(book: JupiterOrderBook) -> dict[str, Any]:
+    yes_bid = max(book.yes_bids, key=lambda level: level.price_usd, default=None)
+    no_bid = max(book.no_bids, key=lambda level: level.price_usd, default=None)
+    yes_asks, no_asks = book.yes_asks, book.no_asks
+    yes_ask = yes_asks[0] if yes_asks else None
+    no_ask = no_asks[0] if no_asks else None
+    yes_depth = sum((level.price_usd * level.quantity for level in yes_asks), Decimal("0"))
+    no_depth = sum((level.price_usd * level.quantity for level in no_asks), Decimal("0"))
+    return {
+        "fetched_at": _iso(book.fetched_at),
+        "yes_bid": _decimal(yes_bid.price_usd) if yes_bid else None,
+        "yes_ask": _decimal(yes_ask.price_usd) if yes_ask else None,
+        "yes_ask_depth_usd": _decimal(yes_depth) if yes_asks else None,
+        "no_bid": _decimal(no_bid.price_usd) if no_bid else None,
+        "no_ask": _decimal(no_ask.price_usd) if no_ask else None,
+        "no_ask_depth_usd": _decimal(no_depth) if no_asks else None,
+        "yes_bids": _levels(book.yes_bids),
+        "yes_asks": _levels(yes_asks),
+        "no_bids": _levels(book.no_bids),
+        "no_asks": _levels(no_asks),
+    }
+
+
+def _classify_moneyline(
+    event: JupiterEvent, score: JupiterLiveScore | None
+) -> tuple[dict[str, JupiterMarket], list[str]]:
+    if not score:
+        return {}, ["No Jupiter score row is available to identify home and away outcomes."]
+    home, away = score.home_team.strip().casefold(), score.away_team.strip().casefold()
+    assignments: dict[str, JupiterMarket] = {}
+    for market in event.markets:
+        if market.sports_market_type != "moneyline":
+            continue
+        team = (market.team_name or "").strip().casefold()
+        title = market.title.strip().casefold()
+        if title in {"draw", "tie", "x"}:
+            outcome = "DRAW"
+        elif team == home or title == home:
+            outcome = "HOME"
+        elif team == away or title == away:
+            outcome = "AWAY"
+        else:
+            continue
+        if outcome in assignments:
+            return {}, [f"Multiple moneyline contracts matched {outcome}; mapping is ambiguous."]
+        assignments[outcome] = market
+    missing = sorted({"HOME", "DRAW", "AWAY"} - assignments.keys())
+    reasons = [f"Missing moneyline outcome: {outcome}." for outcome in missing]
+    return assignments, reasons
+
+
+class LiveMonitor:
+    """Polls verified REST interfaces and streams compact state updates to clients."""
+
+    def __init__(
+        self,
+        *,
+        jupiter: JupiterPredictionClient | None = None,
+        livescore_mcp: LiveScoreMCPClient | None = None,
+        poll_seconds: float | None = None,
+        prematch_refresh_seconds: float = 300.0,
+        persist=persist_event_snapshot,
+    ) -> None:
+        self.jupiter = jupiter or JupiterPredictionClient.from_environment()
+        self.livescore_mcp = livescore_mcp or LiveScoreMCPClient()
+        self.poll_seconds = poll_seconds or float(os.getenv("LIVE_POLL_SECONDS", "30"))
+        self.poll_seconds = min(max(self.poll_seconds, 15.0), 300.0)
+        self.prematch_refresh_seconds = prematch_refresh_seconds
+        self.persist = persist
+        self.selected_event_id: str | None = None
+        self._task: asyncio.Task[None] | None = None
+        self._wake = asyncio.Event()
+        self._stopping = asyncio.Event()
+        self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
+        self._logs: deque[dict[str, str]] = deque(maxlen=100)
+        self._last_fixture_poll = 0.0
+        self._last_prematch_poll = 0.0
+        self._last_score_by_id: dict[str, JupiterLiveScore] = {}
+        self._last_manual_stats_refresh = 0.0
+        self._refresh_lock = asyncio.Lock()
+        self.state: dict[str, Any] = {
+            "service": {"status": "starting", "poll_seconds": self.poll_seconds},
+            "jupiter": {
+                "status": "unconfigured",
+                "auth": "API key loaded" if (os.getenv("JUPITER_API_KEY") or "").strip() else "keyless access",
+                "last_success_at": None,
+                "last_error": None,
+            },
+            "livescore_mcp": {
+                "status": "on_demand",
+                "last_success_at": None,
+                "last_error": None,
+            },
+            "events": [],
+            "prematch_baselines": {"status": "waiting", "last_capture_at": None},
+            "selected_event_id": None,
+            "selected_event": None,
+            "logs": [],
+            "execution": "disabled",
+        }
+
+    async def start(self) -> None:
+        if self._task is None or self._task.done():
+            self._stopping.clear()
+            self._task = asyncio.create_task(self._run(), name="live-match-monitor")
+            self._wake.set()
+
+    async def stop(self) -> None:
+        self._stopping.set()
+        self._wake.set()
+        if self._task:
+            await self._task
+            self._task = None
+
+    def snapshot(self) -> dict[str, Any]:
+        # State is replaced rather than mutated after publish, so shallow nested copies
+        # are safe for this JSON-facing boundary.
+        return {**self.state, "logs": list(self._logs)}
+
+    async def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1)
+        self._subscribers.add(queue)
+        queue.put_nowait(self.snapshot())
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue[dict[str, Any]]) -> None:
+        self._subscribers.discard(queue)
+
+    def _log(self, level: str, message: str) -> None:
+        self._logs.appendleft({"at": datetime.now(UTC).isoformat(), "level": level, "message": message})
+
+    async def _publish(self) -> None:
+        payload = self.snapshot()
+        for queue in tuple(self._subscribers):
+            if queue.full():
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                queue.put_nowait(payload)
+            except asyncio.QueueFull:
+                continue
+
+    async def monitor_event(self, event_id: str | None) -> None:
+        if event_id is not None and not any(row["event_id"] == event_id for row in self.state["events"]):
+            raise ValueError("Select a live Jupiter event from the current list.")
+        self.selected_event_id = event_id
+        self.state = {
+            **self.state,
+            "selected_event_id": event_id,
+            "selected_event": None,
+        }
+        self._log("info", "Match monitoring stopped." if event_id is None else f"Monitoring selected event {event_id}.")
+        await self._publish()
+        self._wake.set()
+
+    async def refresh_match_statistics(self, event_id: str) -> dict[str, Any]:
+        """Fetch one explicitly requested match; never called from the poll loop."""
+        if event_id != self.selected_event_id:
+            raise ValueError("Select and monitor this Jupiter event before fetching match statistics.")
+        score = self._last_score_by_id.get(event_id)
+        if score is None:
+            raise ValueError("Jupiter has not supplied a current score for this selected event.")
+        if time.monotonic() - self._last_manual_stats_refresh < 15.0:
+            raise ValueError("Please wait 15 seconds between LiveScore MCP requests.")
+        self._last_manual_stats_refresh = time.monotonic()
+        try:
+            statistics = await asyncio.to_thread(
+                self.livescore_mcp.get_match_statistics,
+                home_team=score.home_team,
+                away_team=score.away_team,
+                score=score.score or "",
+            )
+            if not statistics.has_statistics:
+                raise LiveScoreMCPError("The selected live match has no match statistics yet.")
+            stored = await asyncio.to_thread(self._save_livescore_statistics, event_id, score, statistics)
+            self.state = {
+                **self.state,
+                "livescore_mcp": {
+                    "status": "healthy",
+                    "last_success_at": _iso(statistics.received_at),
+                    "last_error": None,
+                },
+            }
+            selected = self.state.get("selected_event")
+            if selected and selected.get("event_id") == event_id:
+                selected = {**selected, "statistics": self._statistics_view(statistics, stored)}
+                mapping = {
+                    "status": "verified",
+                    "fixture_id": statistics.match_id,
+                    "name": f"{statistics.home_team} vs {statistics.away_team}",
+                    "verified_at": _iso(statistics.received_at),
+                }
+                selected["fixture_mapping"] = mapping
+                evaluations, audit_input = self._evaluate_selected(score, selected, mapping)
+                selected["strategy_evaluations"] = evaluations
+                selected["data_gates"] = evaluations[0]["gate_results"] if evaluations else {}
+                selected["statistics"]["persistence"] = "saved" if stored else "unavailable"
+                selected["statistics"]["persistence_note"] = None if stored else "Database snapshot could not be saved."
+                self.state = {**self.state, "selected_event": selected}
+                audit_saved, audit_rows = await asyncio.to_thread(
+                    persist_strategy_audit, event_id, evaluations, audit_input,
+                )
+                selected["strategy_audit"] = "saved" if audit_saved else "unavailable"
+                selected["strategy_audit_rows"] = audit_rows
+                self.state = {**self.state, "selected_event": selected}
+            self._log("info", f"Fetched selected-match statistics from LiveScore MCP for event {event_id}.")
+        except LiveScoreMCPError as exc:
+            current = dict(self.state.get("livescore_mcp", {}))
+            current.update(status="error", last_error=str(exc))
+            self.state = {**self.state, "livescore_mcp": current}
+            selected = self.state.get("selected_event")
+            if selected and selected.get("event_id") == event_id:
+                selected = {**selected}
+                previous = selected.get("statistics")
+                if previous and previous.get("status") == "healthy":
+                    selected["statistics"] = {**previous, "last_refresh_error": str(exc)}
+                else:
+                    selected["statistics"] = {"status": "error", "error": str(exc)}
+                self.state = {**self.state, "selected_event": selected}
+            self._log("warning", f"LiveScore MCP match-statistics refresh failed: {exc}")
+        await self._publish()
+        return self.snapshot()
+
+    @staticmethod
+    def _statistics_view(statistics: MatchStatistics, stored: bool) -> dict[str, Any]:
+        return {
+            "status": "healthy",
+            "provider": "livescore_mcp",
+            "match_id": statistics.match_id,
+            "score": statistics.score,
+            "match_verified": True,
+            "score_consistent": statistics.score_consistent,
+            "received_at": _iso(statistics.received_at),
+            "home_shots": statistics.home_shots,
+            "away_shots": statistics.away_shots,
+            "home_shots_on_target": statistics.home_shots_on_target,
+            "away_shots_on_target": statistics.away_shots_on_target,
+            "home_possession": statistics.home_possession,
+            "away_possession": statistics.away_possession,
+            "home_passes": statistics.home_passes,
+            "away_passes": statistics.away_passes,
+            "home_pass_accuracy": statistics.home_pass_accuracy,
+            "away_pass_accuracy": statistics.away_pass_accuracy,
+            "home_fouls": statistics.home_fouls,
+            "away_fouls": statistics.away_fouls,
+            "home_yellow_cards": statistics.home_yellow_cards,
+            "away_yellow_cards": statistics.away_yellow_cards,
+            "home_red_cards": statistics.home_red_cards,
+            "away_red_cards": statistics.away_red_cards,
+            "home_offsides": statistics.home_offsides,
+            "away_offsides": statistics.away_offsides,
+            "home_corners": statistics.home_corners,
+            "away_corners": statistics.away_corners,
+            "persistence": "saved" if stored else "unavailable",
+        }
+
+    @staticmethod
+    def _save_livescore_statistics(event_id: str, score: JupiterLiveScore, statistics: MatchStatistics) -> bool:
+        try:
+            with Session(get_engine()) as session, session.begin():
+                return record_livescore_mcp_statistics(
+                    session, jupiter_event_id=event_id, score=score, statistics=statistics,
+                )
+        except Exception:
+            return False
+
+    async def _run(self) -> None:
+        while not self._stopping.is_set():
+            cycle_started = time.monotonic()
+            try:
+                await self.refresh_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.state = {
+                    **self.state,
+                    "service": {"status": "degraded", "poll_seconds": self.poll_seconds},
+                }
+                self._log("error", "Unexpected monitor error; retrying after the next poll interval.")
+                await self._publish()
+            timeout = max(0.1, self.poll_seconds - (time.monotonic() - cycle_started))
+            self._wake.clear()
+            try:
+                await asyncio.wait_for(self._wake.wait(), timeout=timeout)
+            except TimeoutError:
+                pass
+        self.state = {**self.state, "service": {"status": "stopped", "poll_seconds": self.poll_seconds}}
+        await self._publish()
+
+    async def refresh_once(self) -> None:
+        async with self._refresh_lock:
+            try:
+                page = await asyncio.to_thread(
+                    self.jupiter.list_sports_events,
+                    filter_name="live",
+                    limit=50,
+                    tag="soccer",
+                )
+                scores = (
+                    await asyncio.to_thread(
+                        self.jupiter.get_live_scores,
+                        tuple(event.event_id for event in page.events),
+                    )
+                    if page.events
+                    else ()
+                )
+            except JupiterDataError as exc:
+                current = dict(self.state["jupiter"])
+                current.update(status="error", last_error=str(exc))
+                self.state = {
+                    **self.state,
+                    "service": {"status": "degraded", "poll_seconds": self.poll_seconds},
+                    "jupiter": current,
+                }
+                self._log("error", f"Jupiter feed failed: {exc}")
+                await self._publish()
+                return
+
+            fetched_at = datetime.now(UTC).isoformat()
+            score_by_id = {score.event_id: score for score in scores}
+            self._last_score_by_id = score_by_id
+            event_rows = [
+                {
+                    "event_id": event.event_id,
+                    "title": event.title,
+                    "category": event.category,
+                    "subcategory": event.subcategory,
+                    "scheduled_start_at": _iso(event.scheduled_start_at),
+                    "volume_usd": _decimal(event.reported_volume_usd),
+                    "score": score_by_id.get(event.event_id).score if event.event_id in score_by_id else None,
+                    "home_team": score_by_id.get(event.event_id).home_team if event.event_id in score_by_id else None,
+                    "away_team": score_by_id.get(event.event_id).away_team if event.event_id in score_by_id else None,
+                    "period": score_by_id.get(event.event_id).period if event.event_id in score_by_id else None,
+                    "minute": _minute(score_by_id.get(event.event_id).elapsed) if event.event_id in score_by_id else None,
+                    "status": score_by_id.get(event.event_id).status if event.event_id in score_by_id else None,
+                    "score_updated_at": score_by_id.get(event.event_id).updated_at if event.event_id in score_by_id else None,
+                    "fetched_at": fetched_at,
+                }
+                for event in page.events
+            ]
+            current_jupiter = dict(self.state["jupiter"])
+            current_jupiter.update(status="healthy", last_success_at=fetched_at, last_error=None)
+            self.state = {
+                **self.state,
+                "service": {"status": "running", "poll_seconds": self.poll_seconds},
+                "jupiter": current_jupiter,
+                "events": event_rows,
+                "selected_event_id": self.selected_event_id,
+            }
+            self._log("info", f"Jupiter refresh: {len(event_rows)} live soccer events, {len(scores)} score rows.")
+            await self._poll_upcoming_baselines()
+
+            if self.selected_event_id and self.selected_event_id in score_by_id:
+                await self._refresh_selected(page.events, score_by_id[self.selected_event_id])
+            elif self.selected_event_id:
+                self.state = {
+                    **self.state,
+                    "selected_event": {
+                        "event_id": self.selected_event_id,
+                        "status": "not_in_live_feed",
+                        "error": "Selected event is no longer in Jupiter's live soccer feed.",
+                    },
+                }
+            await self._publish()
+
+    async def _refresh_selected(self, live_events: tuple[JupiterEvent, ...], score: JupiterLiveScore) -> None:
+        event_id = self.selected_event_id
+        if not event_id:
+            return
+        try:
+            event = await asyncio.to_thread(self.jupiter.get_sports_event_details, event_id)
+        except JupiterDataError as exc:
+            self._log("error", f"Selected Jupiter event detail failed: {exc}")
+            self.state = {
+                **self.state,
+                "selected_event": {"event_id": event_id, "status": "stale", "error": str(exc)},
+            }
+            return
+        assigned, mapping_reasons = _classify_moneyline(event, score)
+        books: dict[str, JupiterOrderBook] = {}
+        errors: list[str] = []
+        for outcome in ("HOME", "DRAW", "AWAY"):
+            market = assigned.get(outcome)
+            if not market:
+                continue
+            try:
+                books[market.market_id] = await asyncio.to_thread(self.jupiter.get_orderbook, market.market_id)
+            except JupiterDataError as exc:
+                errors.append(f"{outcome} orderbook unavailable: {exc}")
+
+        book_views = {market_id: orderbook_view(book) for market_id, book in books.items()}
+        try:
+            baseline_prices = await asyncio.to_thread(
+                self._read_baselines,
+                event.event_id,
+                [assigned[key].market_id for key in ("HOME", "AWAY") if key in assigned],
+                event.scheduled_start_at,
+            )
+        except Exception:
+            baseline_prices = {}
+        favorite_baseline = self._choose_prematch_favorite(assigned, baseline_prices)
+        market_rows: list[dict[str, Any]] = []
+        for outcome in ("HOME", "DRAW", "AWAY"):
+            market = assigned.get(outcome)
+            if not market:
+                continue
+            book = book_views.get(market.market_id)
+            market_rows.append(
+                {
+                    "outcome": outcome,
+                    "market_id": market.market_id,
+                    "title": market.title,
+                    "team": market.team_name,
+                    "status": market.status,
+                    "market_volume_usd": _decimal(market.volume_usd),
+                    "api_buy_yes_usd": _decimal(market.buy_yes_usd),
+                    "api_sell_yes_usd": _decimal(market.sell_yes_usd),
+                    "api_buy_no_usd": _decimal(market.buy_no_usd),
+                    "orderbook": book,
+                }
+            )
+        data_status = "healthy" if not errors and not mapping_reasons and len(books) == 3 else "partial"
+        volume = event.reported_volume_usd
+        volume_gate = {
+            "passed": volume is not None and volume >= Decimal("1000000"),
+            "value_usd": _decimal(volume),
+            "reason": "Jupiter event volume is unavailable or below $1,000,000." if volume is None or volume < Decimal("1000000") else None,
+        }
+        previous_selected = self.state.get("selected_event") or {}
+        cached_statistics = previous_selected.get("statistics")
+        selected_view = {
+            "event_id": event.event_id,
+            "title": event.title,
+            "home_team": score.home_team,
+            "away_team": score.away_team,
+            "score": score.score,
+            "status": score.status,
+            "period": score.period,
+            "minute": _minute(score.elapsed),
+            "score_updated_at": score.updated_at,
+            "fetched_at": datetime.now(UTC).isoformat(),
+            "event_volume_usd": _decimal(volume),
+            "volume_gate": volume_gate,
+            "moneyline_complete": not mapping_reasons,
+            "moneyline_gate_reasons": mapping_reasons,
+            "moneyline": market_rows,
+            "market_detail_count": len(event.markets),
+            "orderbook_status": data_status,
+            "orderbook_errors": errors,
+            "persistence": "pending",
+            "statistics": dict(cached_statistics)
+            if previous_selected.get("event_id") == event_id and isinstance(cached_statistics, dict)
+            else None,
+            "prematch_favorite": favorite_baseline,
+        }
+        relevant_markets = tuple(assigned.values())
+        persist_event = replace(event, markets=relevant_markets)
+        orderbook_persistence = {
+            market_id: {
+                key: (Decimal(value) if value is not None else None)
+                for key, value in view.items()
+                if key in {
+                    "yes_bid", "yes_ask", "yes_ask_depth_usd",
+                    "no_bid", "no_ask", "no_ask_depth_usd",
+                }
+            }
+            for market_id, view in book_views.items()
+        }
+        result = await asyncio.to_thread(
+            self.persist,
+            persist_event,
+            score=score,
+            orderbooks=orderbook_persistence,
+        )
+        selected_view["persistence"] = "saved" if result.persisted else "unavailable"
+        selected_view["snapshots_written"] = result.snapshots_written
+        if result.persisted:
+            selected_view["snapshots_written"] = result.snapshots_written
+        else:
+            errors.append("Database write failed or migration is not applied.")
+            selected_view["orderbook_errors"] = errors
+        try:
+            mapping = await asyncio.to_thread(self._read_livescore_mapping, event_id)
+        except Exception:
+            mapping = {"status": "unavailable", "fixture_id": None, "name": None, "verified_at": None}
+        cached_statistics = selected_view.get("statistics") or {}
+        if cached_statistics.get("status") == "healthy" and cached_statistics.get("match_verified"):
+            mapping = {
+                "status": "verified",
+                "fixture_id": cached_statistics.get("match_id"),
+                "name": f"{score.home_team} vs {score.away_team}",
+                "verified_at": cached_statistics.get("received_at"),
+            }
+        selected_view["fixture_mapping"] = mapping
+        evaluations, audit_input = self._evaluate_selected(score, selected_view, mapping)
+        selected_view["strategy_evaluations"] = evaluations
+        audit_saved, audit_rows = await asyncio.to_thread(
+            persist_strategy_audit,
+            event_id,
+            evaluations,
+            audit_input,
+        )
+        selected_view["strategy_audit"] = "saved" if audit_saved else "unavailable"
+        selected_view["strategy_audit_rows"] = audit_rows
+        self.state = {**self.state, "selected_event": selected_view}
+        self._log(
+            "info" if result.persisted else "warning",
+            f"Monitored {event.title}: {len(market_rows)} moneyline outcomes; snapshot storage {selected_view['persistence']}.",
+        )
+
+    def _evaluate_selected(
+        self,
+        score: JupiterLiveScore,
+        selected: dict[str, Any],
+        mapping: dict[str, object],
+    ) -> tuple[list[dict[str, object]], dict[str, object]]:
+        markets: dict[str, MarketQuote] = {}
+        for row in selected["moneyline"]:
+            book = row.get("orderbook") or {}
+            asks = tuple(
+                AskLevel(price=Decimal(level["price_usd"]), quantity=Decimal(level["quantity"]))
+                for level in book.get("yes_asks", [])
+            )
+            markets[row["outcome"]] = MarketQuote(
+                market_id=row["market_id"],
+                bid=Decimal(book["yes_bid"]) if book.get("yes_bid") is not None else None,
+                ask=Decimal(book["yes_ask"]) if book.get("yes_ask") is not None else None,
+                ask_depth_usd=(
+                    Decimal(book["yes_ask_depth_usd"])
+                    if book.get("yes_ask_depth_usd") is not None else None
+                ),
+                asks=asks,
+                observed_at=_parse_time(book.get("fetched_at")),
+            )
+        score_pair = re.fullmatch(r"\s*(\d+)\s*[-:]\s*(\d+)\s*", score.score or "")
+        home_score = int(score_pair.group(1)) if score_pair else None
+        away_score = int(score_pair.group(2)) if score_pair else None
+        stats = selected.get("statistics") or {}
+        mapping_verified = mapping.get("status") == "verified" and stats.get("match_verified") is True
+        stats_score = re.fullmatch(r"\s*(\d+)\s*[-:]\s*(\d+)\s*", stats.get("score") or "")
+        score_consistent = bool(
+            mapping_verified and stats_score and home_score is not None and away_score is not None
+            and int(stats_score.group(1)) == home_score and int(stats_score.group(2)) == away_score
+        )
+        stats["score_consistent"] = score_consistent
+        selected["score_consistent"] = score_consistent
+        context = MatchInputs(
+            event_id=selected["event_id"],
+            status=score.period or score.status or "UNKNOWN",
+            minute=selected.get("minute"),
+            home_score=home_score,
+            away_score=away_score,
+            event_volume_usd=Decimal(selected["event_volume_usd"]) if selected.get("event_volume_usd") else None,
+            event_volume_verified=selected.get("event_volume_usd") is not None,
+            event_observed_at=_parse_time(self.state.get("jupiter", {}).get("last_success_at")),
+            score_observed_at=_parse_time(self.state.get("jupiter", {}).get("last_success_at")),
+            score_updated_at=_parse_time(score.updated_at),
+            stats_mapped_and_verified=mapping_verified and stats.get("status") == "healthy",
+            stats_observed_at=_parse_time(stats.get("received_at")),
+            home_shots=stats.get("home_shots"),
+            away_shots=stats.get("away_shots"),
+            home_possession=Decimal(str(stats["home_possession"])) if stats.get("home_possession") is not None else None,
+            away_possession=Decimal(str(stats["away_possession"])) if stats.get("away_possession") is not None else None,
+            home_corners=stats.get("home_corners"),
+            away_corners=stats.get("away_corners"),
+            score_consistent=score_consistent,
+            markets=markets,
+            prematch_favorite=(
+                selected.get("prematch_favorite", {}).get("outcome")
+                if selected.get("prematch_favorite") else None
+            ),
+            prematch_favorite_probability=(
+                Decimal(selected["prematch_favorite"]["probability"])
+                if selected.get("prematch_favorite") else None
+            ),
+            prematch_source=(
+                selected.get("prematch_favorite", {}).get("source")
+                if selected.get("prematch_favorite") else None
+            ),
+            prematch_observed_at=_parse_time(
+                selected.get("prematch_favorite", {}).get("observed_at")
+                if selected.get("prematch_favorite") else None
+            ),
+        )
+        config = CandidateConfig()
+        results = evaluate_live_match(context, config=config)
+        selected["data_gates"] = results[0]["gate_results"] if results else {}
+        audit = {
+            "jupiter_event_id": selected["event_id"],
+            "livescore_mcp_match_id": str(mapping.get("fixture_id")) if mapping_verified else None,
+            "mapping_status": mapping.get("status"),
+            "prematch_favorite": selected.get("prematch_favorite"),
+            "observed_at": datetime.now(UTC).isoformat(),
+            "source_timestamps": {
+                "event_list_received_at": self.state.get("jupiter", {}).get("last_success_at"),
+                "score_updated_at": score.updated_at,
+                "livescore_mcp_statistics_received_at": stats.get("received_at"),
+                "prematch_favorite_observed_at": (
+                    selected.get("prematch_favorite", {}).get("observed_at")
+                    if selected.get("prematch_favorite") else None
+                ),
+                "orderbooks": {
+                    key: value.observed_at.isoformat() if value.observed_at else None
+                    for key, value in markets.items()
+                },
+            },
+            "score": {"home": home_score, "away": away_score, "period": context.status, "minute": context.minute},
+            "event_volume_usd": str(context.event_volume_usd) if context.event_volume_usd is not None else None,
+            "market_quotes": {
+                key: {
+                    "market_id": value.market_id,
+                    "bid": str(value.bid) if value.bid is not None else None,
+                    "ask": str(value.ask) if value.ask is not None else None,
+                    "ask_depth_usd": str(value.ask_depth_usd) if value.ask_depth_usd is not None else None,
+                }
+                for key, value in markets.items()
+            },
+            "stats": {
+                "home_shots": context.home_shots,
+                "away_shots": context.away_shots,
+                "home_possession": str(context.home_possession) if context.home_possession is not None else None,
+                "away_possession": str(context.away_possession) if context.away_possession is not None else None,
+                "home_corners": context.home_corners,
+                "away_corners": context.away_corners,
+            },
+            "configuration": {
+                "version": "provisional-v1",
+                "max_data_age_seconds": config.max_data_age_seconds,
+                "prematch_max_age_seconds": config.prematch_max_age_seconds,
+                "max_slippage_bps": str(config.max_slippage_bps),
+                "minimum_order_value_usd_provisional": str(config.min_order_value_usd),
+                "corner_threshold_provisional": config.corner_threshold,
+            },
+        }
+        return results, audit
+
+    @staticmethod
+    def _read_livescore_mapping(event_id: str) -> dict[str, object]:
+        with Session(get_engine()) as session:
+            return livescore_mcp_mapping_status(session, event_id)
+
+    @staticmethod
+    def _read_baselines(
+        event_id: str,
+        market_ids: list[str],
+        scheduled_start_at: datetime | None,
+    ) -> dict[str, tuple[Decimal, datetime]]:
+        with Session(get_engine()) as session:
+            return read_prematch_yes_prices(
+                session,
+                event_provider_id=event_id,
+                market_provider_ids=market_ids,
+                scheduled_start_at=scheduled_start_at,
+            )
+
+    @staticmethod
+    def _choose_prematch_favorite(
+        assigned: dict[str, JupiterMarket],
+        baselines: dict[str, tuple[Decimal, datetime]],
+    ) -> dict[str, Any] | None:
+        choices = [
+            (outcome, baselines[market.market_id])
+            for outcome in ("HOME", "AWAY")
+            if (market := assigned.get(outcome)) is not None and market.market_id in baselines
+        ]
+        if not choices:
+            return None
+        outcome, (probability, observed_at) = max(choices, key=lambda row: row[1][0])
+        return {
+            "outcome": outcome,
+            "probability": _decimal(probability),
+            "source": "Jupiter Prediction API prematch YES ask",
+            "observed_at": _iso(observed_at),
+        }
+
+    async def _poll_upcoming_baselines(self) -> None:
+        if time.monotonic() - self._last_prematch_poll < self.prematch_refresh_seconds:
+            return
+        self._last_prematch_poll = time.monotonic()
+        try:
+            page = await asyncio.to_thread(
+                self.jupiter.list_sports_events,
+                filter_name="upcoming",
+                limit=20,
+                tag="soccer",
+                include_markets=True,
+            )
+        except JupiterDataError as exc:
+            self.state = {
+                **self.state,
+                "prematch_baselines": {"status": "error", "last_capture_at": None, "last_error": str(exc)},
+            }
+            self._log("warning", f"Upcoming baseline feed failed: {exc}")
+            return
+        now = datetime.now(UTC)
+        stored = 0
+        unavailable = 0
+        for event in page.events:
+            start = event.scheduled_start_at
+            if start is None or not now < start <= now + timedelta(hours=48):
+                continue
+            if not any(market.sports_market_type == "moneyline" for market in event.markets):
+                continue
+            result = await asyncio.to_thread(persist_prematch_event, event)
+            if result.persisted:
+                stored += result.snapshots_written
+            else:
+                unavailable += 1
+        status = "saved" if stored else "unavailable" if unavailable else "no_eligible_events"
+        self.state = {
+            **self.state,
+            "prematch_baselines": {
+                "status": status,
+                "last_capture_at": now.isoformat(),
+                "events_seen": len(page.events),
+                "snapshot_rows_written": stored,
+            },
+        }
+        self._log("info", f"Prematch scan: stored {stored} moneyline YES/NO observations from upcoming soccer events.")

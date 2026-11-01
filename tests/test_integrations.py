@@ -1,4 +1,5 @@
 from datetime import UTC
+from datetime import datetime
 from decimal import Decimal
 
 import pytest
@@ -37,8 +38,9 @@ def test_jupiter_list_is_read_only_and_converts_micro_usd():
                 "data": [
                     {
                         "eventId": "event-1",
+                        "beginAt": "2026-11-01T18:30:00Z",
                         "category": "sports",
-                        "volumeUsd": "1250000.50",
+                        "volumeUsd": "1345651000000",
                         "metadata": {"title": "Home vs Away", "isLive": True},
                         "markets": [
                             {
@@ -71,7 +73,8 @@ def test_jupiter_list_is_read_only_and_converts_micro_usd():
     page = JupiterPredictionClient(session=session).list_sports_events(filter_name="live")
 
     assert page.events[0].title == "Home vs Away"
-    assert page.events[0].reported_volume_usd == Decimal("1250000.50")
+    assert page.events[0].scheduled_start_at == datetime(2026, 11, 1, 18, 30, tzinfo=UTC)
+    assert page.events[0].reported_volume_usd == Decimal("1345651")
     assert page.events[0].markets[0].buy_yes_usd == Decimal("0.65")
     assert page.events[0].markets[0].sell_yes_usd == Decimal("0.62")
     assert page.events[0].markets[0].volume_usd == Decimal("282173")
@@ -171,6 +174,29 @@ def test_jupiter_event_markets_are_bounded_and_paginated():
     assert kwargs["headers"] == {"x-api-key": "test-key"}
 
 
+def test_jupiter_orderbook_parses_documented_dollar_levels_and_complement_asks(monkeypatch):
+    import integrations.market_data.jupiter as jupiter_module
+
+    monkeypatch.setattr(jupiter_module, "_last_request", 0.0)
+    session = FakeSession(
+        FakeResponse(
+            {
+                "yes": [[60, 4]],
+                "no": [[30, 5]],
+                "yes_dollars": [["0.6000", 4]],
+                "no_dollars": [["0.3000", 5]],
+            }
+        )
+    )
+    book = JupiterPredictionClient(api_key="test-key", session=session).get_orderbook("market-1")
+
+    assert book.yes_bids[0].price_usd == Decimal("0.6000")
+    assert book.yes_asks[0].price_usd == Decimal("0.7000")
+    assert book.no_asks[0].price_usd == Decimal("0.4000")
+    assert book.yes_asks[0].quantity == Decimal("5")
+    assert session.call[0].endswith("/orderbook/market-1")
+
+
 def test_jupiter_event_details_parse_screenshot_market_groups():
     session = FakeSession(
         FakeResponse(
@@ -236,7 +262,7 @@ def test_api_football_parses_live_fixtures_and_nullable_statistics():
             {
                 "response": [
                     {
-                        "fixture": {"id": 77, "status": {"short": "1H", "elapsed": 31}},
+                        "fixture": {"id": 77, "date": "2026-11-01T18:30:00+00:00", "status": {"short": "1H", "elapsed": 31}},
                         "league": {"name": "League"},
                         "teams": {"home": {"name": "Home"}, "away": {"name": "Away"}},
                         "goals": {"home": 0, "away": 1},
@@ -248,6 +274,7 @@ def test_api_football_parses_live_fixtures_and_nullable_statistics():
     fixture_client = ApiFootballClient(api_key="test-key", session=live_session, minimum_request_interval_seconds=0)
     fixtures = fixture_client.get_live_fixtures()
     assert fixtures[0].fixture_id == 77
+    assert fixtures[0].scheduled_start_at == datetime(2026, 11, 1, 18, 30, tzinfo=UTC)
     assert fixtures[0].elapsed_minute == 31
     assert fixtures[0].home_score == 0
 

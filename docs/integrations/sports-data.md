@@ -2,11 +2,13 @@
 
 Checked: 2026-10-31 against providers' official documentation, pricing, and terms pages.
 
+> **Current status (2026-11-01):** [LiveScore MCP](livescore-mcp.md) is integrated for manually requested selected-match statistics. The older API-Football adapter details below are retained as historical research; the live monitor does not call it. Earlier provider comparisons are available in [three free live-statistics options](free-live-statistics-options.md).
+
 ## Current dashboard feed: Jupiter soccer events and scores
 
 The dashboard filters `GET /events` with `category=sports`, `tags=soccer`, and `filter=live`, then requests `GET /events/scores` for the returned event IDs. A live check on 2026-10-31 returned soccer events and matching score rows. Jupiter exposes teams, score, period, elapsed time, status, and update time in its documented score schema. It does **not** document shots, possession, or corners in that response, so those statistics are left blank/unavailable rather than inferred.
 
-## Optional richer statistics: API-Football adapter, not activated
+## Legacy provider research: API-Football adapter, not used by the live monitor
 
 The adapter implements read-only calls to API-Football's documented `/fixtures?live=all` and `/fixtures/statistics?fixture={id}` endpoints. It reads fixture IDs, team names, status, elapsed minute, score, total shots, possession, and corners. Each statistics request is made only after an operator selects one fixture; the UI does not fetch statistics for every match.
 
@@ -26,9 +28,9 @@ Activation requires `API_FOOTBALL_KEY` in the local ignored `.env`. The adapter 
 
 ## Event mapping policy
 
-Jupiter events can aggregate providers and contain one or more binary markets. API-Football uses its own numeric fixture IDs. Team-name similarity alone is not a verified mapping. The dashboard displays these feeds separately and does not join them. Until a reviewed explicit mapping with source IDs and kickoff validation exists, data from the two providers cannot be used together for a signal.
+The current LiveScore MCP mapping policy is documented in [its integration note](livescore-mcp.md): one unique home/away team pair is required, and ambiguous candidates fail closed. Team identity can be accepted when the provider score lags Jupiter, but the strategy score-consistency gate remains blocked. The legacy API-Football mapper uses separate provider-specific IDs and is not called by the live monitor.
 
-Provider retrieval timestamps are recorded separately from provider-reported update timestamps. API-Football's implemented fixture and statistics endpoints do not supply a common update timestamp in this adapter, so the displayed time is when this app received the response. This is not proof that the upstream match data was updated at that exact moment.
+The dashboard records the LiveScore MCP response receipt time. The provider response does not expose an upstream timestamp used by this integration, so the display time is not proof that the upstream data changed at that exact moment.
 
 ## Official sources
 

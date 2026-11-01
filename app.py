@@ -6,6 +6,7 @@ from decimal import Decimal, ROUND_HALF_UP
 import streamlit as st
 
 from database.connection import check_database
+from integrations.market_data.capture import capture_selected_event
 from integrations.market_data.jupiter import (
     JupiterDataError,
     JupiterEvent,
@@ -31,9 +32,23 @@ def fetch_live_soccer() -> tuple[JupiterEventPage, tuple[JupiterLiveScore, ...]]
     return events, scores
 
 
-@st.cache_data(ttl=30, show_spinner=False)
-def fetch_soccer_markets(event_id: str) -> JupiterEvent:
-    return JupiterPredictionClient.from_environment().get_sports_event_details(event_id)
+def _capture_market_selection() -> None:
+    event_id = st.session_state.get("soccer_market_event_id")
+    data = st.session_state.get("soccer_data")
+    if not event_id or not data:
+        return
+    event_page, scores = data
+    score = next((item for item in scores if item.event_id == event_id), None)
+    try:
+        result = capture_selected_event(event_id, score=score)
+        st.session_state.soccer_market_detail = result.event
+        st.session_state.soccer_capture_status = (
+            f"Recorded {result.snapshots_written} YES/NO market observations." if result.persisted
+            else "Markets loaded, but snapshots were not saved. Check database configuration/schema."
+        )
+    except JupiterDataError as exc:
+        st.session_state.soccer_market_detail = None
+        st.session_state.soccer_capture_status = f"Market detail request failed: {exc}"
 
 
 def _price_cents(value: Decimal | None) -> str:
@@ -101,20 +116,21 @@ if data:
         st.dataframe(rows, width="stretch", hide_index=True)
         st.caption(f"{len(event_page.events)} live-tagged soccer events · {len(score_rows)} score rows")
 
-        selected_event = st.selectbox(
+        selected_event_id = st.selectbox(
             "Match market details",
-            event_page.events,
-            format_func=lambda event: event.title,
-            key="soccer_market_event",
+            [event.event_id for event in event_page.events],
+            format_func=lambda event_id: next(
+                (event.title for event in event_page.events if event.event_id == event_id), str(event_id)
+            ),
+            on_change=_capture_market_selection,
+            key="soccer_market_event_id",
         )
-        if st.button("Load match market details"):
-            fetch_soccer_markets.clear()
-            try:
-                with st.spinner("Loading markets for the selected match…"):
-                    st.session_state.soccer_market_detail = fetch_soccer_markets(selected_event.event_id)
-            except JupiterDataError as exc:
-                st.session_state.soccer_market_detail = None
-                st.error(str(exc))
+        selected_event = next(event for event in event_page.events if event.event_id == selected_event_id)
+        if st.button("Refresh markets & record snapshot"):
+            with st.spinner("Loading selected match markets and recording observations…"):
+                _capture_market_selection()
+        if st.session_state.get("soccer_capture_status"):
+            st.caption(st.session_state.soccer_capture_status)
 
         market_event: JupiterEvent | None = st.session_state.get("soccer_market_detail")
         if market_event and market_event.event_id == selected_event.event_id:

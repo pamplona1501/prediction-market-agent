@@ -17,3 +17,25 @@
 - Jupiter IDs and API-Football fixture IDs are not joined by team-name similarity. A validated manual mapping is required before the app can combine observations.
 - The Jupiter and API-Football adapters are read-only, suppress response bodies and credentials, retry transient failures with bounded exponential backoff and jitter, and do not submit transactions.
 - The official Jupiter example README points to a wallet-enabled trading UI. Its signing and order flows were not used.
+
+## 2026-11-01 — Live monitoring foundation
+
+- Keep the existing Streamlit app available, while adding FastAPI as the always-on monitor API and a dependency-free browser UI for live state. This avoids disrupting the existing dashboard while providing WebSocket updates.
+- Jupiter ingestion is bounded REST polling. The browser WebSocket is an app-level push channel, not a Jupiter feed subscription.
+- Orderbook candidates are built only for the selected event's supported three-way moneyline. Binary YES/NO orderbook sides are normalized to HOME/DRAW/AWAY using exact event outcome names.
+- Upcoming event discovery stores pre-match prices, enabling same-market baseline checks. Missing baselines fail closed.
+- API-Football fixture matching is user-selected and explicitly verified by team names and kickoff time before statistics can be used.
+- Add persistent market/match snapshots and strategy evaluation audit rows. Strategy results remain candidate/rejection diagnostics only; no paper or real orders are produced.
+- Use bounded monitor subscriptions and log retention to prevent slow browser clients or long-running sessions from accumulating unbounded memory.
+- Keep the service local-only by default (`127.0.0.1`); authentication is not implemented, so network exposure is unsupported.
+- Normalize Jupiter event `volumeUsd` from the micro-USD integer scale to actual USD at ingestion, and format displayed amounts as whole-dollar currency for scanability.
+- Remove the API-Football setup prompt and fixture-mapping controls from the browser UI while evaluating replacement statistics sources. Do not imply Jupiter includes shots/possession/corners; candidate strategies requiring those inputs stay blocked.
+- Show 🔥 for event volume strictly above US$1M. Show ⭐ only when a monitored event has at least one strategy evaluation in `candidate` status, which means that strategy's trigger and all hard eligibility gates passed.
+- Label the feed near-live/auto-refreshing: Jupiter is polled over REST on a target interval and its upstream score freshness may lag. The browser's WebSocket only transports the app's latest state.
+
+## 2026-11-01 — LiveScore MCP statistics
+
+- Use LiveScore MCP as the initial additional source for in-game shots, shots on target, possession, and corners. It is called only after an explicit user action for the selected match; do not add scheduled polling because the hosted service prohibits automated harvesting.
+- Resolve one provider match by unique home/away team pair, with conservative name normalization and an exact score preferred when available. Recheck team orientation in the detail response; reject missing or ambiguous results. A score mismatch is shown but blocks strategy eligibility.
+- Store the accepted match reference and observation in the provider-reference and match-snapshot tables. Migration `0005_match_statistics_categories` adds fields for the requested team stats. Enforce a 15-second manual request cooldown.
+- Review personal/non-commercial usage terms and any applicable data rights before hosting or commercial use. See `docs/integrations/livescore-mcp.md`.

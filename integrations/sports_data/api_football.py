@@ -34,6 +34,7 @@ class LiveFixture:
     league: str
     home_team: str
     away_team: str
+    scheduled_start_at: datetime | None
     status: str
     elapsed_minute: int | None
     home_score: int | None
@@ -135,6 +136,7 @@ class ApiFootballClient:
                     league=str(league.get("name") or "Unknown competition"),
                     home_team=str(home.get("name") or "Unknown home team"),
                     away_team=str(away.get("name") or "Unknown away team"),
+                    scheduled_start_at=_optional_datetime(fixture.get("date")),
                     status=str(status.get("short") or "UNKNOWN"),
                     elapsed_minute=_optional_int(status.get("elapsed")),
                     home_score=_optional_int(goals.get("home")),
@@ -181,6 +183,18 @@ def _optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _optional_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _optional_percent(value: Any) -> float | None:
