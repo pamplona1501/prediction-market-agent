@@ -2,7 +2,7 @@
 
 ## Behavior
 
-The FastAPI dashboard uses LiveScore MCP as an **on-demand**, read-only statistics source. It does not poll this service in the background. Select a Jupiter match and use **Fetch match stats** (then **Refresh stats** when needed). The app waits at least 15 seconds between requests; one refresh makes two MCP tool calls: `get_live_scores` to resolve the provider match, then `get_match` for that one match.
+The FastAPI dashboard uses LiveScore MCP as an **on-demand**, read-only statistics source. It does not poll this service in the background. Selecting a Jupiter match triggers the initial statistics fetch; use **Refresh stats** for later updates. The app waits at least 15 seconds between requests; one refresh makes two MCP tool calls: `get_live_scores` to resolve the provider match, then `get_match` for that one match.
 
 The adapter uses Streamable HTTP at `https://livescoremcp.com/mcp` by default. No API key is required. An alternate HTTPS endpoint can be set with `LIVESCORE_MCP_URL`. For both match discovery and selected match details, it requests the provider's compact structured/text response (`format: "text"`): raw JSON is capped at 60,000 characters and can truncate either the worldwide live feed or a detailed match. The adapter reads total shots, shots on target, possession, total passes, pass accuracy, fouls, yellow/red cards, offsides, and corners for both teams. Pass accuracy is calculated from completed passes divided by total passes when both values are valid.
 
@@ -14,6 +14,6 @@ Verified observations append to `match_snapshots` with `source="livescore_mcp"`.
 
 ## Usage and limits
 
-The upstream repository describes the hosted service as free for personal, non-commercial use, limits usage to 30 tool calls per minute, and prohibits bulk scraping and automated data harvesting. This app therefore makes no scheduled or automatic statistics requests and exposes only a manual request for the selected event. Confirm the provider's current terms and any data rights for your intended use before hosting, redistribution, or commercial use. The provider says its football data comes from Football Mania.
+The upstream repository describes the hosted service as free for personal, non-commercial use, limits usage to 30 tool calls per minute, and prohibits bulk scraping and automated data harvesting. This app makes no scheduled/background requests: each fetch is initiated by selecting or refreshing one match. Confirm the provider's current terms and any data rights for your intended use before hosting, redistribution, or commercial use. The provider says its football data comes from Football Mania.
 
 References: [LiveScore MCP README](https://github.com/holoduke/livescore-mcp/blob/main/README.md), [tool definitions and match-stat fields](https://github.com/holoduke/livescore-mcp/blob/main/tools.go).

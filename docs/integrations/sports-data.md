@@ -2,7 +2,7 @@
 
 Checked: 2026-10-31 against providers' official documentation, pricing, and terms pages.
 
-> **Current status (2026-11-01):** [LiveScore MCP](livescore-mcp.md) is integrated for manually requested selected-match statistics. The older API-Football adapter details below are retained as historical research; the live monitor does not call it. Earlier provider comparisons are available in [three free live-statistics options](free-live-statistics-options.md).
+> **Current status (2026-11-01):** [LiveScore MCP](livescore-mcp.md) is integrated for on-demand selected-match statistics. Selecting a match triggers its initial fetch; later updates are manual. The older API-Football adapter details below are retained as historical research; the live monitor does not call it. Earlier provider comparisons are available in [three free live-statistics options](free-live-statistics-options.md).
 
 ## Current dashboard feed: Jupiter soccer events and scores
 

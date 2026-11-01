@@ -5,7 +5,8 @@ This monitor reports strategy candidates and rejected checks. It is **read-only*
 ## Data and safety rules
 
 - **Jupiter is authoritative** for event identity, market IDs, prices, depth, scores, and event volume. LiveScore MCP supplies supplemental soccer statistics only.
-- Match statistics are fetched manually for the selected event. Accept a provider match only when one unique home/away team pair matches in that order and its detail confirms the teams. Never infer a match from score alone.
+- Matches whose Jupiter score status or period is `SUSPENDED` are hidden from the live list and removed from monitoring.
+- Selecting a match triggers one initial LiveScore statistics fetch; later updates are user-triggered. Accept a provider match only when one unique home/away team pair matches in that order and its detail confirms the teams. Never infer a match from score alone.
 - Missing or ambiguous mapping, inconsistent scores, invalid quotes, or stale/missing observations block candidates. Stats may be shown when the provider score lags, but score inconsistency still blocks eligibility. Never fill gaps with sample or invented live data.
 - The current freshness limit is **90 seconds** for in-play inputs. Jupiter is polled about every **30 seconds**; this is near-real-time monitoring, not a push feed. LiveScore stats do not refresh automatically.
 

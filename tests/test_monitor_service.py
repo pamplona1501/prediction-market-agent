@@ -4,7 +4,7 @@ from decimal import Decimal
 from integrations.market_data.jupiter import (
     JupiterEvent, JupiterLiveScore, JupiterMarket, JupiterOrderBook, OrderBookLevel,
 )
-from monitoring.service import LiveMonitor, _classify_moneyline, orderbook_view
+from monitoring.service import LiveMonitor, _classify_moneyline, _exclude_suspended_events, orderbook_view
 
 
 def _market(market_id, title, team):
@@ -101,3 +101,25 @@ def test_live_score_provider_is_on_demand_and_not_polled_during_initialization()
     monitor = LiveMonitor(livescore_mcp=fake)
     assert monitor.snapshot()["livescore_mcp"]["status"] == "on_demand"
     assert fake.calls == 0
+
+
+def test_suspended_status_excludes_match_from_live_list():
+    visible = _event()
+    suspended = JupiterEvent(
+        event_id="suspended-event", title="Suspended FC vs Paused FC", category="sports",
+        subcategory="soccer", scheduled_start_at=datetime.now(UTC), is_live=True,
+        reported_volume_usd=Decimal("2000000"), markets=visible.markets,
+    )
+    suspended_score = JupiterLiveScore(
+        event_id="suspended-event", league_abbreviation="EPL",
+        home_team="Suspended FC", away_team="Paused FC", score="0-0",
+        period="1H", elapsed="20", status=" sUsPeNdEd ",
+        updated_at=datetime.now(UTC).isoformat(),
+    )
+
+    visible_events, suspended_ids = _exclude_suspended_events(
+        (visible, suspended), (_score(), suspended_score),
+    )
+
+    assert [event.event_id for event in visible_events] == ["j-event"]
+    assert suspended_ids == {"suspended-event"}

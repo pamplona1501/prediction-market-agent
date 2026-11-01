@@ -45,6 +45,21 @@ def _minute(value: str | None) -> int | None:
     return int(match.group()) if match else None
 
 
+def _is_suspended(value: str | None) -> bool:
+    return isinstance(value, str) and value.strip().casefold() == "suspended"
+
+
+def _exclude_suspended_events(
+    events: tuple[JupiterEvent, ...], scores: tuple[JupiterLiveScore, ...],
+) -> tuple[tuple[JupiterEvent, ...], set[str]]:
+    scores_by_id = {score.event_id: score for score in scores}
+    suspended_ids = {
+        event_id for event_id, score in scores_by_id.items()
+        if _is_suspended(score.status) or _is_suspended(score.period)
+    }
+    return tuple(event for event in events if event.event_id not in suspended_ids), suspended_ids
+
+
 def _parse_time(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -384,7 +399,17 @@ class LiveMonitor:
 
             fetched_at = datetime.now(UTC).isoformat()
             score_by_id = {score.event_id: score for score in scores}
-            self._last_score_by_id = score_by_id
+            visible_events, suspended_ids = _exclude_suspended_events(page.events, scores)
+            visible_event_ids = {event.event_id for event in visible_events}
+            visible_score_by_id = {
+                event_id: score for event_id, score in score_by_id.items()
+                if event_id in visible_event_ids
+            }
+            self._last_score_by_id = visible_score_by_id
+            if self.selected_event_id in suspended_ids:
+                self._log("info", f"Stopped monitoring suspended match {self.selected_event_id}.")
+                self.selected_event_id = None
+                self.state = {**self.state, "selected_event": None}
             event_rows = [
                 {
                     "event_id": event.event_id,
@@ -393,16 +418,16 @@ class LiveMonitor:
                     "subcategory": event.subcategory,
                     "scheduled_start_at": _iso(event.scheduled_start_at),
                     "volume_usd": _decimal(event.reported_volume_usd),
-                    "score": score_by_id.get(event.event_id).score if event.event_id in score_by_id else None,
-                    "home_team": score_by_id.get(event.event_id).home_team if event.event_id in score_by_id else None,
-                    "away_team": score_by_id.get(event.event_id).away_team if event.event_id in score_by_id else None,
-                    "period": score_by_id.get(event.event_id).period if event.event_id in score_by_id else None,
-                    "minute": _minute(score_by_id.get(event.event_id).elapsed) if event.event_id in score_by_id else None,
-                    "status": score_by_id.get(event.event_id).status if event.event_id in score_by_id else None,
-                    "score_updated_at": score_by_id.get(event.event_id).updated_at if event.event_id in score_by_id else None,
+                    "score": visible_score_by_id.get(event.event_id).score if event.event_id in visible_score_by_id else None,
+                    "home_team": visible_score_by_id.get(event.event_id).home_team if event.event_id in visible_score_by_id else None,
+                    "away_team": visible_score_by_id.get(event.event_id).away_team if event.event_id in visible_score_by_id else None,
+                    "period": visible_score_by_id.get(event.event_id).period if event.event_id in visible_score_by_id else None,
+                    "minute": _minute(visible_score_by_id.get(event.event_id).elapsed) if event.event_id in visible_score_by_id else None,
+                    "status": visible_score_by_id.get(event.event_id).status if event.event_id in visible_score_by_id else None,
+                    "score_updated_at": visible_score_by_id.get(event.event_id).updated_at if event.event_id in visible_score_by_id else None,
                     "fetched_at": fetched_at,
                 }
-                for event in page.events
+                for event in visible_events
             ]
             current_jupiter = dict(self.state["jupiter"])
             current_jupiter.update(status="healthy", last_success_at=fetched_at, last_error=None)
@@ -413,11 +438,11 @@ class LiveMonitor:
                 "events": event_rows,
                 "selected_event_id": self.selected_event_id,
             }
-            self._log("info", f"Jupiter refresh: {len(event_rows)} live soccer events, {len(scores)} score rows.")
+            self._log("info", f"Jupiter refresh: {len(event_rows)} live soccer events; suspended matches hidden.")
             await self._poll_upcoming_baselines()
 
-            if self.selected_event_id and self.selected_event_id in score_by_id:
-                await self._refresh_selected(page.events, score_by_id[self.selected_event_id])
+            if self.selected_event_id and self.selected_event_id in visible_score_by_id:
+                await self._refresh_selected(visible_events, visible_score_by_id[self.selected_event_id])
             elif self.selected_event_id:
                 self.state = {
                     **self.state,

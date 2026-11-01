@@ -86,7 +86,7 @@ function renderGates(selected) {
     ["First-half time ≤ 45′", !!(selected && isFirstHalf(selected) && selected.minute != null && selected.minute <= 45),
       selected ? (selected.period || selected.status || "Status unavailable") + " · " + (selected.minute == null ? "minute missing" : selected.minute) : "Waiting for match clock"],
     ["In-game statistics", !!(mapping.status === "verified" && selected.statistics && selected.statistics.status === "healthy"),
-      selected ? (selected.statistics && selected.statistics.status === "healthy" ? "LiveScore MCP · exact teams and score verified" : "Use Fetch match stats to make one on-demand request") : "Waiting for selected match"],
+      selected ? (selected.statistics && selected.statistics.status === "healthy" ? "LiveScore MCP · exact teams and score verified" : "Stats load automatically when you select the match") : "Waiting for selected match"],
     ["Fresh, consistent sources", !!(dataGates.fresh_data && dataGates.score_consistent),
       selected ? (dataGates.fresh_data && dataGates.score_consistent ? "All source timestamps within configured age" : "One or more source freshness or score checks failed") : "Waiting for current provider timestamps"],
     ["Executable order-book depth", !!(selected && (selected.moneyline || []).some((m) => Number(m.orderbook && m.orderbook.yes_ask_depth_usd || 0) > 0)),
@@ -241,6 +241,46 @@ async function requestMonitor(eventId) {
   }
   render(await response.json());
 }
+const delay = (milliseconds) => new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+async function waitForSelectedDetails(eventId) {
+  const deadline = Date.now() + 45000;
+  while (Date.now() < deadline) {
+    const response = await fetch("/api/state");
+    const state = await response.json();
+    render(state);
+    if (state.selected_event_id !== eventId) {
+      throw new Error("The selected match changed before its details loaded.");
+    }
+    if (state.selected_event && state.selected_event.event_id === eventId) {
+      if (state.selected_event.status === "not_in_live_feed") {
+        throw new Error("Jupiter has no current score for this match.");
+      }
+      return;
+    }
+    await delay(500);
+  }
+  throw new Error("The selected match details did not load in time. Try selecting it again.");
+}
+async function requestStatistics(eventId, retryCooldown = true) {
+  const response = await fetch("/api/statistics/refresh", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ event_id: eventId }),
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    const message = error.detail || "Statistics refresh failed (" + response.status + ")";
+    if (retryCooldown && response.status === 409 && message.includes("Please wait 15 seconds")) {
+      $("#topNotice").textContent = "LiveScore cooldown active; the initial stats request will retry in 15 seconds.";
+      $("#topNotice").hidden = false;
+      await delay(15000);
+      const current = await fetch("/api/state").then((result) => result.json());
+      if (current.selected_event_id !== eventId) return;
+      return requestStatistics(eventId, false);
+    }
+    throw new Error(message);
+  }
+  render(await response.json());
+}
 document.addEventListener("click", async (event) => {
   const refreshStats = event.target.closest("[data-refresh-stats]");
   const start = event.target.closest("[data-monitor]");
@@ -250,29 +290,31 @@ document.addEventListener("click", async (event) => {
     refreshStats.disabled = true;
     refreshStats.textContent = "Fetching…";
     try {
-      const response = await fetch("/api/statistics/refresh", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ event_id: refreshStats.dataset.refreshStats }),
-      });
-      if (!response.ok) {
-        const error = await response.json().catch(() => ({}));
-        throw new Error(error.detail || "Statistics refresh failed (" + response.status + ")");
-      }
-      render(await response.json());
+      await requestStatistics(refreshStats.dataset.refreshStats);
     } catch (error) {
       $("#topNotice").textContent = error.message;
       $("#topNotice").hidden = false;
     } finally {
       statisticsRefreshPending = false;
+      fetch("/api/state").then((response) => response.json()).then(render).catch(() => {});
     }
     return;
   }
   if (!start && !stop) return;
+  const eventId = stop ? null : start.dataset.monitor;
+  statisticsRefreshPending = !!eventId;
   try {
-    await requestMonitor(stop ? null : start.dataset.monitor);
+    await requestMonitor(eventId);
+    if (eventId) {
+      await waitForSelectedDetails(eventId);
+      await requestStatistics(eventId);
+    }
   } catch (error) {
     $("#topNotice").textContent = error.message;
     $("#topNotice").hidden = false;
+  } finally {
+    statisticsRefreshPending = false;
+    fetch("/api/state").then((response) => response.json()).then(render).catch(() => {});
   }
 });
 function connect() {
