@@ -143,9 +143,10 @@ function renderMatch(selected) {
       "</span></div></article>";
   }).join("");
   const stats = selected.statistics;
+  const statsLoading = statisticsRefreshPending || (stats && stats.status === "loading");
   const statsButton = '<button class="stats-refresh" data-refresh-stats="' + esc(selected.event_id) + '"' +
-    (statisticsRefreshPending ? " disabled" : "") + ">" +
-    (statisticsRefreshPending ? "Fetching…" : (stats && stats.status === "healthy" ? "Refresh stats" : "Fetch match stats")) + "</button>";
+    (statsLoading ? " disabled" : "") + ">" +
+    (statsLoading ? "Fetching…" : (stats && stats.status === "healthy" ? "Refresh stats" : "Fetch match stats")) + "</button>";
   const statsRows = [
     ["Shots", stats && stats.home_shots, stats && stats.away_shots],
     ["Shots on target", stats && stats.home_shots_on_target, stats && stats.away_shots_on_target],
@@ -242,25 +243,6 @@ async function requestMonitor(eventId) {
   render(await response.json());
 }
 const delay = (milliseconds) => new Promise((resolve) => window.setTimeout(resolve, milliseconds));
-async function waitForSelectedDetails(eventId) {
-  const deadline = Date.now() + 45000;
-  while (Date.now() < deadline) {
-    const response = await fetch("/api/state");
-    const state = await response.json();
-    render(state);
-    if (state.selected_event_id !== eventId) {
-      throw new Error("The selected match changed before its details loaded.");
-    }
-    if (state.selected_event && state.selected_event.event_id === eventId) {
-      if (state.selected_event.status === "not_in_live_feed") {
-        throw new Error("Jupiter has no current score for this match.");
-      }
-      return;
-    }
-    await delay(500);
-  }
-  throw new Error("The selected match details did not load in time. Try selecting it again.");
-}
 async function requestStatistics(eventId, retryCooldown = true) {
   const response = await fetch("/api/statistics/refresh", {
     method: "POST", headers: { "Content-Type": "application/json" },
@@ -302,13 +284,8 @@ document.addEventListener("click", async (event) => {
   }
   if (!start && !stop) return;
   const eventId = stop ? null : start.dataset.monitor;
-  statisticsRefreshPending = !!eventId;
   try {
     await requestMonitor(eventId);
-    if (eventId) {
-      await waitForSelectedDetails(eventId);
-      await requestStatistics(eventId);
-    }
   } catch (error) {
     $("#topNotice").textContent = error.message;
     $("#topNotice").hidden = false;

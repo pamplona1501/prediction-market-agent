@@ -148,6 +148,7 @@ class LiveMonitor:
         self.persist = persist
         self.selected_event_id: str | None = None
         self._task: asyncio.Task[None] | None = None
+        self._stats_autofetch_task: asyncio.Task[None] | None = None
         self._wake = asyncio.Event()
         self._stopping = asyncio.Event()
         self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
@@ -155,7 +156,7 @@ class LiveMonitor:
         self._last_fixture_poll = 0.0
         self._last_prematch_poll = 0.0
         self._last_score_by_id: dict[str, JupiterLiveScore] = {}
-        self._last_manual_stats_refresh = 0.0
+        self._last_manual_stats_refresh: float | None = None
         self._refresh_lock = asyncio.Lock()
         self.state: dict[str, Any] = {
             "service": {"status": "starting", "poll_seconds": self.poll_seconds},
@@ -187,6 +188,10 @@ class LiveMonitor:
     async def stop(self) -> None:
         self._stopping.set()
         self._wake.set()
+        if self._stats_autofetch_task:
+            self._stats_autofetch_task.cancel()
+            await asyncio.gather(self._stats_autofetch_task, return_exceptions=True)
+            self._stats_autofetch_task = None
         if self._task:
             await self._task
             self._task = None
@@ -224,6 +229,9 @@ class LiveMonitor:
     async def monitor_event(self, event_id: str | None) -> None:
         if event_id is not None and not any(row["event_id"] == event_id for row in self.state["events"]):
             raise ValueError("Select a live Jupiter event from the current list.")
+        if self._stats_autofetch_task and not self._stats_autofetch_task.done():
+            self._stats_autofetch_task.cancel()
+            self._stats_autofetch_task = None
         self.selected_event_id = event_id
         self.state = {
             **self.state,
@@ -233,15 +241,64 @@ class LiveMonitor:
         self._log("info", "Match monitoring stopped." if event_id is None else f"Monitoring selected event {event_id}.")
         await self._publish()
         self._wake.set()
+        if event_id is not None:
+            self._stats_autofetch_task = asyncio.create_task(
+                self._fetch_initial_statistics(event_id),
+                name=f"initial-match-stats-{event_id}",
+            )
+
+    async def _fetch_initial_statistics(self, event_id: str) -> None:
+        """Fetch stats once after this user-selected event's Jupiter detail is ready."""
+        deadline = time.monotonic() + 45.0
+        while self.selected_event_id == event_id:
+            selected = self.state.get("selected_event")
+            if selected and selected.get("event_id") == event_id:
+                if selected.get("status") == "not_in_live_feed":
+                    self._log("warning", f"Skipped initial statistics fetch; Jupiter has no current score for {event_id}.")
+                    return
+                selected = {**selected, "statistics": {"status": "loading", "provider": "livescore_mcp"}}
+                self.state = {**self.state, "selected_event": selected}
+                self._log("info", f"Fetching initial LiveScore MCP statistics for selected event {event_id}.")
+                await self._publish()
+                break
+            if time.monotonic() >= deadline:
+                self._log("warning", f"Initial statistics fetch timed out waiting for Jupiter details for {event_id}.")
+                await self._publish()
+                return
+            await asyncio.sleep(0.2)
+        else:
+            return
+
+        # Respect the same provider cooldown as manual refreshes, even when
+        # the user selects another match soon after a previous stats request.
+        remaining = (
+            15.0 - (time.monotonic() - self._last_manual_stats_refresh)
+            if self._last_manual_stats_refresh is not None else 0.0
+        )
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+        if self.selected_event_id == event_id:
+            try:
+                await self.refresh_match_statistics(event_id)
+            except ValueError as exc:
+                selected = self.state.get("selected_event")
+                if selected and selected.get("event_id") == event_id:
+                    selected = {**selected, "statistics": {"status": "error", "error": str(exc)}}
+                    self.state = {**self.state, "selected_event": selected}
+                self._log("warning", f"Initial LiveScore MCP statistics fetch failed: {exc}")
+                await self._publish()
 
     async def refresh_match_statistics(self, event_id: str) -> dict[str, Any]:
-        """Fetch one explicitly requested match; never called from the poll loop."""
+        """Fetch one user-selected match; never called from the recurring poll loop."""
         if event_id != self.selected_event_id:
             raise ValueError("Select and monitor this Jupiter event before fetching match statistics.")
         score = self._last_score_by_id.get(event_id)
         if score is None:
             raise ValueError("Jupiter has not supplied a current score for this selected event.")
-        if time.monotonic() - self._last_manual_stats_refresh < 15.0:
+        if (
+            self._last_manual_stats_refresh is not None
+            and time.monotonic() - self._last_manual_stats_refresh < 15.0
+        ):
             raise ValueError("Please wait 15 seconds between LiveScore MCP requests.")
         self._last_manual_stats_refresh = time.monotonic()
         try:
@@ -347,6 +404,9 @@ class LiveMonitor:
 
     async def _run(self) -> None:
         while not self._stopping.is_set():
+            # Clear before work so a selection wake-up arriving during a poll
+            # is not discarded just before the following wait.
+            self._wake.clear()
             cycle_started = time.monotonic()
             try:
                 await self.refresh_once()
@@ -360,7 +420,6 @@ class LiveMonitor:
                 self._log("error", "Unexpected monitor error; retrying after the next poll interval.")
                 await self._publish()
             timeout = max(0.1, self.poll_seconds - (time.monotonic() - cycle_started))
-            self._wake.clear()
             try:
                 await asyncio.wait_for(self._wake.wait(), timeout=timeout)
             except TimeoutError:
