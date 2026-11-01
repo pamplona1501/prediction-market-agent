@@ -31,7 +31,7 @@ Apply Alembic migrations through the current head before relying on persistence.
 
 ## Strategy boundary
 
-The evaluator follows the project's master specification: UnderDog Scouter, Draw Compression, and Heavy Favorite Rebound. Shared hard gates require a supported three-way market, sufficient event volume, first-half timing, fresh and consistent source data, verified match statistics, usable ask-side depth, and acceptable estimated slippage. Strategies requiring statistics remain blocked until the user fetches fresh data for that match. Candidate/rejection diagnostics are persisted and shown in the UI; the system has no order execution path. Real-money trading is disabled.
+The evaluator follows the project's master specification: UnderDog Scouter, Draw Compression, and Heavy Favorite Rebound. Shared hard gates require a supported three-way market, sufficient event volume, first-half timing, fresh and consistent source data, verified match statistics, usable ask-side depth, and acceptable estimated slippage. Strategies requiring statistics remain blocked until the user fetches fresh data for that match. Candidate/rejection diagnostics are persisted and shown in the UI; the system has no order execution path. Real-money trading is disabled. See [Core Rules](../CORE_RULES.md) for the exact current thresholds, trigger conditions, and safety boundaries.
 
 ## Service and security boundary
 
