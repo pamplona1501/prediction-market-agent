@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -12,6 +13,7 @@ from typing import Any
 from urllib.parse import quote
 
 import requests
+import httpx
 
 from integrations.http import SafeReadError, read_only_get
 
@@ -237,12 +239,57 @@ class JupiterPredictionClient:
         *,
         base_url: str = BASE_URL,
         session: requests.Session | None = None,
+        async_client: httpx.AsyncClient | None = None,
         timeout_seconds: float = 10.0,
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._session = session or requests.Session()
+        self._async_client = async_client
+        self._owns_async_client = async_client is None
+        self._async_rate_lock = asyncio.Lock()
+        self._async_last_request = 0.0
         self._timeout_seconds = timeout_seconds
+
+    async def open(self) -> None:
+        if self._async_client is None:
+            self._async_client = httpx.AsyncClient(timeout=self._timeout_seconds)
+
+    async def close(self) -> None:
+        if self._owns_async_client and self._async_client is not None:
+            await self._async_client.aclose()
+            self._async_client = None
+
+    async def _aget_json(self, path: str, params: dict[str, object]) -> Any:
+        if self._async_client is None:
+            raise JupiterDataError("Jupiter async client is not started.")
+        async with self._async_rate_lock:
+            wait = _KEYLESS_INTERVAL_SECONDS - (time.monotonic() - self._async_last_request)
+            if self._async_last_request and wait > 0:
+                await asyncio.sleep(wait)
+            self._async_last_request = time.monotonic()
+        headers = {"x-api-key": self._api_key} if self._api_key else {}
+        url = f"{self._base_url}/{path.lstrip('/')}"
+        for attempt in range(3):
+            try:
+                response = await self._async_client.get(url, params=params, headers=headers)
+            except httpx.RequestError:
+                if attempt == 2:
+                    raise JupiterDataError("Jupiter could not be reached. Check connectivity and try again.") from None
+                await asyncio.sleep(min(2 ** (attempt + 1), 8))
+                continue
+            if response.status_code == 429:
+                raise JupiterDataError("Jupiter rate limit reached. Wait before refreshing.")
+            if 500 <= response.status_code < 600 and attempt < 2:
+                await asyncio.sleep(min(2 ** (attempt + 1), 8))
+                continue
+            if not response.is_success:
+                raise JupiterDataError(f"Jupiter returned HTTP {response.status_code}.")
+            try:
+                return response.json()
+            except ValueError:
+                raise JupiterDataError("Jupiter returned an unreadable response.") from None
+        raise JupiterDataError("Jupiter request failed. Try again later.")
 
     @classmethod
     def from_environment(cls) -> "JupiterPredictionClient":
@@ -375,6 +422,81 @@ class JupiterPredictionClient:
         if not market_id or len(market_id) > 160:
             raise ValueError("market_id must be a non-empty provider ID")
         payload = self._get_json(f"orderbook/{quote(market_id, safe='')}", {})
+        if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+            payload = payload["data"]
+        if not isinstance(payload, dict):
+            raise JupiterDataError("Jupiter response did not match the documented orderbook format.")
+        yes_key = "yes_dollars" if isinstance(payload.get("yes_dollars"), list) else "yes"
+        no_key = "no_dollars" if isinstance(payload.get("no_dollars"), list) else "no"
+        if not isinstance(payload.get(yes_key), list) or not isinstance(payload.get(no_key), list):
+            raise JupiterDataError("Jupiter response did not contain YES/NO orderbook levels.")
+        return JupiterOrderBook(
+            market_id=market_id,
+            yes_bids=_parse_orderbook_levels(payload[yes_key], dollars=yes_key.endswith("dollars")),
+            no_bids=_parse_orderbook_levels(payload[no_key], dollars=no_key.endswith("dollars")),
+            fetched_at=datetime.now(UTC),
+        )
+
+    async def alist_sports_events(
+        self, *, filter_name: str = "live", limit: int = 20,
+        tag: str | None = None, include_markets: bool = False,
+    ) -> JupiterEventPage:
+        if filter_name not in {"live", "upcoming", "trending"}:
+            raise ValueError("Unsupported Jupiter event filter")
+        if not 1 <= limit <= 50:
+            raise ValueError("limit must be between 1 and 50")
+        params: dict[str, object] = {
+            "category": "sports", "filter": filter_name,
+            "includeMarkets": "true" if include_markets else "false",
+            "start": 0, "end": limit,
+        }
+        if tag:
+            if not 1 <= len(tag) <= 48 or not tag.replace("-", "").isalnum():
+                raise ValueError("tag must be a short alphanumeric tag")
+            params["tags"] = tag
+        payload = await self._aget_json("events", params)
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            raise JupiterDataError("Jupiter response did not match the documented event format.")
+        events = tuple(event for raw in payload["data"] if (event := _parse_event(raw)) is not None)
+        return JupiterEventPage(events, datetime.now(UTC), filter_name)
+
+    async def aget_live_scores(self, event_ids: list[str] | tuple[str, ...]) -> tuple[JupiterLiveScore, ...]:
+        if not event_ids or len(event_ids) > 100 or any(not event_id or len(event_id) > 160 for event_id in event_ids):
+            raise ValueError("event_ids must contain between 1 and 100 valid provider IDs")
+        payload = await self._aget_json("events/scores", {"eventIds": ",".join(event_ids)})
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            raise JupiterDataError("Jupiter response did not match the documented live-scores format.")
+        return tuple(
+            JupiterLiveScore(
+                event_id=str(item["eventId"]),
+                league_abbreviation=str(item["leagueAbbreviation"]) if item.get("leagueAbbreviation") is not None else None,
+                home_team=str(item.get("homeTeam") or "Unknown home team"),
+                away_team=str(item.get("awayTeam") or "Unknown away team"),
+                score=str(item["score"]) if item.get("score") is not None else None,
+                period=str(item["period"]) if item.get("period") is not None else None,
+                elapsed=str(item["elapsed"]) if item.get("elapsed") is not None else None,
+                status=str(item["status"]) if item.get("status") is not None else None,
+                updated_at=str(item["updatedAt"]) if item.get("updatedAt") is not None else None,
+            )
+            for item in payload["data"]
+            if isinstance(item, dict) and item.get("eventId")
+        )
+
+    async def aget_sports_event_details(self, event_id: str) -> JupiterEvent:
+        if not event_id or len(event_id) > 160:
+            raise ValueError("event_id must be a non-empty provider ID")
+        payload = await self._aget_json(f"events/{quote(event_id, safe='')}", {})
+        if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+            payload = payload["data"]
+        event = _parse_event(payload)
+        if event is None or event.event_id != event_id:
+            raise JupiterDataError("Jupiter event response did not match the requested event ID.")
+        return event
+
+    async def aget_orderbook(self, market_id: str) -> JupiterOrderBook:
+        if not market_id or len(market_id) > 160:
+            raise ValueError("market_id must be a non-empty provider ID")
+        payload = await self._aget_json(f"orderbook/{quote(market_id, safe='')}", {})
         if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
             payload = payload["data"]
         if not isinstance(payload, dict):

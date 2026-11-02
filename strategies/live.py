@@ -33,6 +33,8 @@ class CandidateConfig:
     max_slippage_bps: Decimal = Decimal("50")
     min_order_value_usd: Decimal = Decimal("5")
     corner_threshold: int = 3  # provisional; master specification leaves it unspecified
+    underdog_favorite_boundary: Decimal = Decimal("0.75")
+    underdog_max_ask: Decimal = Decimal("0.26")
 
 
 @dataclass(frozen=True)
@@ -157,11 +159,19 @@ def evaluate_live_match(
             or (possession is not None and possession >= Decimal("50"))
             or (corners is not None and corners >= config.corner_threshold)
         )
+        underdog_limit = (
+            config.underdog_max_ask
+            if inputs.prematch_favorite_probability is not None
+            and inputs.prematch_favorite_probability >= config.underdog_favorite_boundary
+            else Decimal("0.25")
+        )
         triggered = bool(
             outcome in trailing and quote and quote.ask is not None
-            and quote.ask <= Decimal("0.25") and attack
+            and quote.ask <= underdog_limit and attack
         )
-        reason = [] if triggered else ["Requires a trailing team, executable ask ≤ $0.25, and shots/possession/corners confirmation."]
+        reason = [] if triggered else [
+            f"Requires a trailing team, executable ask ≤ ${underdog_limit}, and shots/possession/corners confirmation."
+        ]
         evaluations.append(("UNDERDOG_SCOUTER", outcome, triggered, reason))
 
     shots_total = (
@@ -170,15 +180,26 @@ def evaluate_live_match(
         else None
     )
     draw = inputs.markets.get("DRAW")
+    draw_inflated = bool(
+        inputs.home_score == 0 and inputs.away_score == 0
+        and inputs.minute is not None and 25 <= inputs.minute <= 40
+        and _first_half(inputs.status)
+        and draw and draw.ask is not None and draw.ask >= Decimal("0.30")
+    )
     draw_triggered = bool(
         draw and draw.ask is not None and draw.ask <= Decimal("0.15")
         and inputs.home_score == 0 and inputs.away_score == 0
         and inputs.minute is not None and 25 <= inputs.minute <= 40
         and _first_half(inputs.status) and shots_total is not None and shots_total <= 3
     )
+    draw_reasons = (
+        ["HARD WARNING: Draw contract is inflated at 30¢ or higher; no-trade boundary rejected."]
+        if draw_inflated else
+        [] if draw_triggered else ["Requires 0–0, minutes 25–40, ≤3 combined shots, and draw ask ≤ $0.15."]
+    )
     evaluations.append((
         "DRAW_COMPRESSION", "DRAW", draw_triggered,
-        [] if draw_triggered else ["Requires 0–0, minutes 25–40, ≤3 combined shots, and draw ask ≤ $0.15."],
+        draw_reasons,
     ))
 
     favorite = inputs.prematch_favorite if inputs.prematch_favorite in {"HOME", "AWAY"} else None
@@ -226,12 +247,13 @@ def evaluate_live_match(
             "strategy_version": "1.0",
             "outcome": outcome,
             "market_id": quote.market_id if quote else None,
-            "status": "candidate" if candidate else "rejected" if triggered else "no_trigger",
+            "status": "candidate" if candidate else "rejected" if triggered or (strategy == "DRAW_COMPRESSION" and draw_inflated) else "no_trigger",
             "triggered": triggered,
             "evaluated_at": now.astimezone(UTC).isoformat(),
             "ask": str(quote.ask) if quote and quote.ask is not None else None,
             "gate_results": local_gates,
             "reasons": list(dict.fromkeys(local_reasons)),
-            "configuration_version": "provisional-v1",
+            "hard_warning": strategy == "DRAW_COMPRESSION" and draw_inflated,
+            "configuration_version": "provisional-v2",
         })
     return results

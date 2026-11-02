@@ -7,17 +7,17 @@ Jupiter REST ───────┐
                     ├─> bounded monitor loop ─> normalized event state ─> strategy candidates
 LiveScore MCP ──────┴─> on-demand selected-match refresh        │                    │
                                       ├─> SQLAlchemy snapshots/audit <─────────────┘
-                                      └─> bounded subscriber queue ─> FastAPI WebSocket ─> browser UI
+                                      └─> bounded subscriber queue ─> FastAPI SSE ─> browser UI
 ```
 
-`live_app.main` owns the HTTP/WebSocket surface. `monitoring.service` performs scheduled Jupiter ingestion and assembles a current view. Provider adapters own HTTP/MCP parsing; `integrations.market_data.capture` and the `database` modules handle normalization and persistence; `strategies.live` is a pure candidate evaluator. The legacy Streamlit pages are retained as a separate research UI. LiveScore MCP is called once when the user selects a match, then only on an explicit refresh action.
+`live_app.main` owns the HTTP/SSE surface. `monitoring.service` performs scheduled Jupiter ingestion and assembles a current view. Provider adapters own HTTP/MCP parsing; `integrations.market_data.capture` and the `database` modules handle normalization and persistence; `strategies.live` is a pure candidate evaluator. The legacy Streamlit pages are retained as a separate research UI. LiveScore MCP is called once when the user selects a match, then only on an explicit refresh action.
 
 ## Refresh and resource bounds
 
 - The selected in-play event is refreshed at a configurable interval (default 30 seconds; accepted range 15–300 seconds).
 - LiveScore MCP statistics are never polled in the monitor loop. Selecting a match triggers one initial fetch; later requests require the refresh button. Requests are rate-limited to one every 15 seconds and fetch details for only one exact selected match. Upcoming Jupiter events are scanned at a slower interval to capture pre-match quotes.
 - The monitor requests orderbooks only for the selected match's three moneyline markets. It does not download every event's complete market list on each cycle.
-- Provider and SQLAlchemy operations run with `asyncio.to_thread` so blocking I/O does not block the event loop.
+- Jupiter and LiveScore MCP use lifecycle-managed `httpx.AsyncClient` instances with bounded retries and secret-safe errors. Synchronous SQLAlchemy work runs with `asyncio.to_thread` so database calls do not block the event loop.
 - Per-browser update queues have capacity one; a slow client receives the latest state instead of an unbounded backlog. The service log retains at most 100 entries.
 - API failures are surfaced as stale/unavailable source state; they do not create prices or statistics from fixtures or examples.
 
@@ -33,6 +33,12 @@ Apply Alembic migrations through the current head before relying on persistence.
 
 The evaluator follows the project's master specification: UnderDog Scouter, Draw Compression, and Heavy Favorite Rebound. Shared hard gates require a supported three-way market, sufficient event volume, first-half timing, fresh and consistent source data, verified match statistics, usable ask-side depth, and acceptable estimated slippage. Strategies requiring statistics remain blocked until the user fetches fresh data for that match. Candidate/rejection diagnostics are persisted and shown in the UI; the system has no order execution path. Real-money trading is disabled. See [Core Rules](../CORE_RULES.md) for the exact current thresholds, trigger conditions, and safety boundaries.
 
+## Streaming and source cadence
+
+The browser subscribes to `/api/events` using Server-Sent Events. Each connection receives the latest snapshot first, then the newest state after each publication. Queues hold one item, replacing stale queued state for slow clients; heartbeat comments keep idle connections alive. Browsers reconnect automatically.
+
+Jupiter Prediction API is currently consumed through REST polling at a default 30-second interval (configured range 15–300 seconds). No supported Jupiter Prediction push feed has been identified. SSE is a browser delivery mechanism and does not make provider observations fresher. Provider requests retain conservative spacing to respect rate limits.
+
 ## Service and security boundary
 
 Local start command:
@@ -41,6 +47,6 @@ Local start command:
 python -m uvicorn live_app.main:app --host 127.0.0.1 --port 8502
 ```
 
-The UI's `/api/*` endpoints and WebSocket currently have no authentication or CSRF protection. Loopback binding is therefore the supported local mode. Do not bind to `0.0.0.0`, forward the port, or host this service publicly until authentication, origin controls, deployment secrets, and operational monitoring are added.
+The UI's `/api/*` endpoints and SSE stream currently have no authentication or CSRF protection. Loopback binding is therefore the supported local mode. Do not bind to `0.0.0.0`, forward the port, or host this service publicly until authentication, origin controls, deployment secrets, and operational monitoring are added.
 
-Jupiter is polled over REST; the app's WebSocket is only the server-to-browser update channel. The UI is near-real-time and depends on API availability, rate limits, and the machine running the service.
+The UI is near-real-time and depends on API availability, rate limits, and the machine running the service.

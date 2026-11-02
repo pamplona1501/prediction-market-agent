@@ -6,12 +6,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
 import json
+import asyncio
 import os
 import re
 from typing import Any
 import unicodedata
 
 import requests
+import httpx
 
 
 DEFAULT_ENDPOINT = "https://livescoremcp.com/mcp"
@@ -281,13 +283,161 @@ class LiveScoreMCPClient:
         endpoint: str | None = None,
         *,
         session: requests.Session | None = None,
+        async_client: httpx.AsyncClient | None = None,
         timeout_seconds: float = 12.0,
     ) -> None:
         self.endpoint = (endpoint or os.getenv("LIVESCORE_MCP_URL") or DEFAULT_ENDPOINT).strip()
         if not self.endpoint.startswith("https://"):
             raise ValueError("LiveScore MCP endpoint must use HTTPS.")
         self._session = session or requests.Session()
+        self._request_id = 0
+        self._async_client = async_client
+        self._owns_async_client = async_client is None
+        self._async_request_id = 0
+        self._request_lock = asyncio.Lock()
         self._timeout_seconds = timeout_seconds
+
+    async def open(self) -> None:
+        if self._async_client is None:
+            self._async_client = httpx.AsyncClient(timeout=self._timeout_seconds)
+
+    async def close(self) -> None:
+        if self._owns_async_client and self._async_client is not None:
+            await self._async_client.aclose()
+            self._async_client = None
+
+    async def _apost(self, payload: dict[str, Any], session_id: str | None = None) -> tuple[Any, str | None]:
+        if self._async_client is None:
+            raise LiveScoreMCPError("LiveScore MCP async client is not started.")
+        headers = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
+        if session_id:
+            headers["Mcp-Session-Id"] = session_id
+        for attempt in range(3):
+            try:
+                response = await self._async_client.post(
+                    self.endpoint, headers=headers, json=payload,
+                )
+            except httpx.RequestError:
+                if attempt == 2:
+                    raise LiveScoreMCPError("LiveScore MCP could not be reached. Check network access and try again.") from None
+                await asyncio.sleep(min(2 ** (attempt + 1), 8))
+                continue
+            if response.status_code == 429:
+                raise LiveScoreMCPError("LiveScore MCP rate limit reached. Wait before requesting another refresh.")
+            if 500 <= response.status_code < 600 and attempt < 2:
+                await asyncio.sleep(min(2 ** (attempt + 1), 8))
+                continue
+            if not response.is_success and response.status_code != 202:
+                raise LiveScoreMCPError(f"LiveScore MCP returned HTTP {response.status_code}.")
+            new_session_id = response.headers.get("Mcp-Session-Id") or session_id
+            if response.status_code == 202 or not response.content:
+                return None, new_session_id
+            try:
+                if "text/event-stream" in response.headers.get("content-type", ""):
+                    data = next((line[5:].strip() for line in response.text.splitlines() if line.startswith("data:")), "")
+                    message = json.loads(data) if data else None
+                else:
+                    message = response.json()
+            except (ValueError, AttributeError):
+                raise LiveScoreMCPError("LiveScore MCP returned invalid JSON-RPC data.") from None
+            if not isinstance(message, dict):
+                raise LiveScoreMCPError("LiveScore MCP returned an invalid JSON-RPC envelope.")
+            if "error" in message:
+                raise LiveScoreMCPError("LiveScore MCP rejected the read-only request.")
+            return message.get("result"), new_session_id
+        raise LiveScoreMCPError("LiveScore MCP request failed. Try again later.")
+
+    async def _anext_id(self) -> int:
+        async with self._request_lock:
+            self._async_request_id += 1
+            return self._async_request_id
+
+    async def _atool(self, name: str, arguments: dict[str, Any], session_id: str | None) -> tuple[Any, str | None]:
+        result, session_id = await self._apost({
+            "jsonrpc": "2.0", "id": await self._anext_id(), "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        }, session_id)
+        if not isinstance(result, dict):
+            raise LiveScoreMCPError("LiveScore MCP returned an empty tool result.")
+        return _decode_tool_result(result), session_id
+
+    async def _ainitialize(self) -> str | None:
+        result, session_id = await self._apost({
+            "jsonrpc": "2.0", "id": await self._anext_id(), "method": "initialize",
+            "params": {"protocolVersion": PROTOCOL_VERSION, "capabilities": {},
+                       "clientInfo": {"name": "prediction-market-agent", "version": "0.1.0"}},
+        })
+        if not isinstance(result, dict) or not isinstance(result.get("protocolVersion"), str):
+            raise LiveScoreMCPError("LiveScore MCP did not complete the MCP initialization handshake.")
+        await self._apost({"jsonrpc": "2.0", "method": "notifications/initialized"}, session_id)
+        return session_id
+
+    async def aget_match_statistics(self, *, home_team: str, away_team: str, score: str) -> MatchStatistics:
+        """Async version for the background monitor; resolves one exact selected match only."""
+        expected_score = _score(score)
+        if not expected_score or not home_team.strip() or not away_team.strip():
+            raise ValueError("Exact Jupiter team names and a parseable score are required.")
+        session_id = await self._ainitialize()
+        live_feed, session_id = await self._atool("get_live_scores", {"format": "text"}, session_id)
+        candidates = [row for row in _live_match_rows(live_feed)
+                      if same_team_name(row["home"], home_team) and same_team_name(row["away"], away_team)]
+        exact = [row for row in candidates if row["score"] == expected_score]
+        if len(exact) == 1:
+            match_row = exact[0]
+        elif len(exact) > 1:
+            raise LiveScoreMCPError("More than one LiveScore match matched Jupiter; match identity is ambiguous.")
+        elif len(candidates) == 1:
+            match_row = candidates[0]
+        elif len(candidates) > 1:
+            raise LiveScoreMCPError("More than one LiveScore match matched Jupiter; match identity is ambiguous.")
+        else:
+            live_rows = _live_match_rows(live_feed)
+            query_home, query_away = _team_key(home_team), _team_key(away_team)
+            closest = sorted(
+                (((SequenceMatcher(None, query_home, _team_key(row["home"])).ratio()
+                   + SequenceMatcher(None, query_away, _team_key(row["away"])).ratio()) / 2, row)
+                 for row in live_rows),
+                key=lambda item: item[0], reverse=True,
+            )
+            suggestions = [f"{row['home']} vs {row['away']}" for ratio, row in closest[:2] if ratio >= 0.45]
+            suffix = (" Closest provider names: " + "; ".join(suggestions) + "."
+                      if suggestions else
+                      f" MCP returned {len(live_rows)} parseable live match(es); check spelling or provider coverage.")
+            raise LiveScoreMCPError("No LiveScore match has the same home and away teams as Jupiter." + suffix)
+        details, _ = await self._atool("get_match", {"id": match_row["id"], "h2h": False, "format": "text"}, session_id)
+        if isinstance(details, str):
+            details = _match_detail_from_text(details)
+        match = next((item for item in _walk_dicts(details) if str(item.get("id", "")) == match_row["id"]),
+                     details if isinstance(details, dict) else None)
+        if not isinstance(match, dict):
+            raise LiveScoreMCPError("LiveScore MCP returned no details for the selected match.")
+        detail_home, detail_away = _team_name(match.get("localteam")), _team_name(match.get("visitorteam"))
+        detail_score = _score(match.get("scoretime") or match.get("score"))
+        if (not detail_home or not detail_away or not same_team_name(detail_home, home_team)
+                or not same_team_name(detail_away, away_team)):
+            raise LiveScoreMCPError("Match details do not agree with Jupiter's home/away teams; statistics were rejected.")
+        commentaries = match.get("commentaries") if isinstance(match.get("commentaries"), dict) else {}
+        stats = commentaries.get("stats") if isinstance(commentaries.get("stats"), dict) else {}
+        home = stats.get("localteam") if isinstance(stats.get("localteam"), dict) else {}
+        away = stats.get("visitorteam") if isinstance(stats.get("visitorteam"), dict) else {}
+        hp, ap = _int(home.get("passestotal")), _int(away.get("passestotal"))
+        return MatchStatistics(
+            match_id=match_row["id"], home_team=detail_home, away_team=detail_away,
+            score=detail_score, score_consistent=detail_score == expected_score,
+            status=str(match.get("status")) if match.get("status") is not None else None,
+            minute=_int(match.get("minute") or match.get("elapsed") or match.get("time")),
+            home_shots=_int(home.get("shotstotal")), away_shots=_int(away.get("shotstotal")),
+            home_shots_on_target=_int(home.get("shotsgoal")), away_shots_on_target=_int(away.get("shotsgoal")),
+            home_possession=_float(home.get("possestiontime")), away_possession=_float(away.get("possestiontime")),
+            home_passes=hp, away_passes=ap,
+            home_pass_accuracy=_pass_accuracy(_int(home.get("passesaccurate")), hp),
+            away_pass_accuracy=_pass_accuracy(_int(away.get("passesaccurate")), ap),
+            home_fouls=_int(home.get("fouls")), away_fouls=_int(away.get("fouls")),
+            home_yellow_cards=_int(home.get("yellowcards")), away_yellow_cards=_int(away.get("yellowcards")),
+            home_red_cards=_int(home.get("redcards")), away_red_cards=_int(away.get("redcards")),
+            home_offsides=_int(home.get("offsides")), away_offsides=_int(away.get("offsides")),
+            home_corners=_int(home.get("corners")), away_corners=_int(away.get("corners")), received_at=datetime.now(UTC),
+        )
         self._request_id = 0
 
     def _post(self, payload: dict[str, Any], session_id: str | None = None) -> tuple[Any, str | None]:

@@ -21,6 +21,7 @@ button { font: inherit; }
 .topbar { height: 72px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #1a2731; }
 .brand { color: var(--soft); display: flex; gap: 11px; align-items: center; text-decoration: none; font: 600 14px 'Space Grotesk', sans-serif; letter-spacing: -.02em; }
 .brand b { color: #fff; font-weight: 600; }
+.brand-version { color: var(--muted); border-left: 1px solid var(--line2); padding-left: 10px; font: 10px 'DM Mono', monospace; letter-spacing: .04em; }
 .brand-mark { display: grid; place-items: center; width: 30px; height: 30px; border: 1px solid #477147; color: var(--green); border-radius: 9px; font: 600 10px 'DM Mono', monospace; background: #142219; }
 .top-status { display: flex; align-items: center; gap: 9px; color: var(--muted); font: 11px 'DM Mono', monospace; }
 .live-dot,.pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--amber); box-shadow: 0 0 12px #e8bb6255; }
@@ -56,6 +57,7 @@ h1 { margin-top: 10px; font: 600 32px 'Space Grotesk', sans-serif; letter-spacin
 .provider-state.error { color: var(--red); }
 .notice { margin: 0 0 15px; border: 1px solid #584a2d; background: #1d1a13; color: #e3c57f; padding: 11px 13px; border-radius: 7px; font-size: 12px; }
 .notice[hidden] { display: none; }
+.notice.hard-warning { border-color: #8d3940; background: #281419; color: #ffb7ad; font-weight: 700; }
 .workspace { display: grid; grid-template-columns: minmax(280px, 360px) minmax(0, 1fr); gap: 18px; align-items: start; }
 .panel { background: linear-gradient(145deg, #0e161e, #0b1218 75%); border: 1px solid var(--line); border-radius: 10px; }
 .event-panel { position: sticky; top: 16px; padding: 18px 16px 0; }

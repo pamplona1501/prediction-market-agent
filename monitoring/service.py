@@ -1,4 +1,4 @@
-"""Near-live provider polling with bounded WebSocket fan-out."""
+"""Near-live provider polling with bounded async subscriber fan-out."""
 
 from __future__ import annotations
 
@@ -181,6 +181,8 @@ class LiveMonitor:
 
     async def start(self) -> None:
         if self._task is None or self._task.done():
+            await self.jupiter.open()
+            await self.livescore_mcp.open()
             self._stopping.clear()
             self._task = asyncio.create_task(self._run(), name="live-match-monitor")
             self._wake.set()
@@ -195,6 +197,8 @@ class LiveMonitor:
         if self._task:
             await self._task
             self._task = None
+        await self.jupiter.close()
+        await self.livescore_mcp.close()
 
     def snapshot(self) -> dict[str, Any]:
         # State is replaced rather than mutated after publish, so shallow nested copies
@@ -302,8 +306,7 @@ class LiveMonitor:
             raise ValueError("Please wait 15 seconds between LiveScore MCP requests.")
         self._last_manual_stats_refresh = time.monotonic()
         try:
-            statistics = await asyncio.to_thread(
-                self.livescore_mcp.get_match_statistics,
+            statistics = await self.livescore_mcp.aget_match_statistics(
                 home_team=score.home_team,
                 away_team=score.away_team,
                 score=score.score or "",
@@ -430,15 +433,13 @@ class LiveMonitor:
     async def refresh_once(self) -> None:
         async with self._refresh_lock:
             try:
-                page = await asyncio.to_thread(
-                    self.jupiter.list_sports_events,
+                page = await self.jupiter.alist_sports_events(
                     filter_name="live",
                     limit=50,
                     tag="soccer",
                 )
                 scores = (
-                    await asyncio.to_thread(
-                        self.jupiter.get_live_scores,
+                    await self.jupiter.aget_live_scores(
                         tuple(event.event_id for event in page.events),
                     )
                     if page.events
@@ -518,7 +519,7 @@ class LiveMonitor:
         if not event_id:
             return
         try:
-            event = await asyncio.to_thread(self.jupiter.get_sports_event_details, event_id)
+            event = await self.jupiter.aget_sports_event_details(event_id)
         except JupiterDataError as exc:
             self._log("error", f"Selected Jupiter event detail failed: {exc}")
             self.state = {
@@ -534,7 +535,7 @@ class LiveMonitor:
             if not market:
                 continue
             try:
-                books[market.market_id] = await asyncio.to_thread(self.jupiter.get_orderbook, market.market_id)
+                books[market.market_id] = await self.jupiter.aget_orderbook(market.market_id)
             except JupiterDataError as exc:
                 errors.append(f"{outcome} orderbook unavailable: {exc}")
 
@@ -828,8 +829,7 @@ class LiveMonitor:
             return
         self._last_prematch_poll = time.monotonic()
         try:
-            page = await asyncio.to_thread(
-                self.jupiter.list_sports_events,
+            page = await self.jupiter.alist_sports_events(
                 filter_name="upcoming",
                 limit=20,
                 tag="soccer",

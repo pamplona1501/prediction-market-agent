@@ -7,14 +7,14 @@ Updated: 2026-11-01
 - Milestones 0–1 project baseline, Windows setup, local secret handling, SQLAlchemy models, Alembic migration history, and the existing Streamlit research dashboard.
 - Read-only Jupiter soccer event discovery, live score polling, three-way moneyline orderbook retrieval, and binary YES/NO quote normalization.
 - On-demand LiveScore MCP statistics integration: selecting a match triggers one initial fetch; later updates require a refresh action. Exact team/score matching, a 15-second request cooldown, SQLAlchemy match snapshots and provider references. The prior API-Football adapter is no longer connected to the live monitor.
-- FastAPI live-monitor service and responsive browser UI. The worker uses bounded asynchronous scheduling with synchronous provider/database calls moved to worker threads. The browser receives service updates over WebSocket.
+- FastAPI live-monitor service and responsive browser UI. Jupiter and LiveScore MCP use lifecycle-managed async HTTP clients; synchronous SQLAlchemy operations run in worker threads. Browser updates stream over Server-Sent Events with bounded per-client queues.
 - Selected-market quote/depth snapshots, match score/stat snapshots, pre-match reference-price observations, and strategy-evaluation audit records in SQLAlchemy. Migration `0005` adds the requested extended match-stat fields.
 - Three candidate-only strategies from the project master specification, with shared fail-closed gates. The service never creates orders, paper positions, signatures, or transactions.
 - Tests for strategy rules, quote parsing, persistence, event mapping, and monitor normalization.
 
 ## Runtime behavior and limitations
 
-- Jupiter is queried via REST polling; no upstream Prediction API WebSocket has been identified. Browser updates are pushed from this app's FastAPI service over WebSocket.
+- Jupiter is queried via REST polling; no supported upstream Prediction API push feed has been identified. Browser updates stream immediately after this app publishes state, but provider data remains near-live at the configured polling cadence.
 - Only the selected in-play event receives detailed orderbook polling. Upcoming soccer events are scanned periodically to collect pre-match reference quotes.
 - The strategy rules need live shots/possession/corners; Jupiter's score API does not provide those fields. Statistics are fetched when a match is selected and become stale under the existing freshness gate. Missing mappings, usable statistics, baseline, freshness, orderbook depth, or another hard gate also block candidates.
 - Candidate results are diagnostic records, not recommendations to execute. Real-money trading remains disabled.

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -17,6 +18,10 @@ from monitoring.service import LiveMonitor
 
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+
+
+def _sse_message(payload: dict[str, Any]) -> str:
+    return "data: " + json.dumps(payload, separators=(",", ":")) + "\n\n"
 
 
 class MonitorRequest(BaseModel):
@@ -29,8 +34,10 @@ def create_app(monitor: LiveMonitor | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         await service.start()
-        yield
-        await service.stop()
+        try:
+            yield
+        finally:
+            await service.stop()
 
     app = FastAPI(
         title="Prediction Market Match Monitor",
@@ -70,18 +77,27 @@ def create_app(monitor: LiveMonitor | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from None
 
-    @app.websocket("/ws/events")
-    async def stream_events(websocket: WebSocket) -> None:
-        await websocket.accept()
+    @app.get("/api/events")
+    async def stream_events(request: Request) -> StreamingResponse:
         queue = await service.subscribe()
-        try:
-            while True:
-                payload = await queue.get()
-                await websocket.send_json(payload)
-        except (WebSocketDisconnect, RuntimeError):
-            pass
-        finally:
-            service.unsubscribe(queue)
+
+        async def event_stream():
+            try:
+                while not await request.is_disconnected():
+                    try:
+                        payload = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    except TimeoutError:
+                        yield ": keep-alive\n\n"
+                        continue
+                    yield _sse_message(payload)
+            finally:
+                service.unsubscribe(queue)
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:

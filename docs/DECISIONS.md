@@ -20,8 +20,8 @@
 
 ## 2026-11-01 — Live monitoring foundation
 
-- Keep the existing Streamlit app available, while adding FastAPI as the always-on monitor API and a dependency-free browser UI for live state. This avoids disrupting the existing dashboard while providing WebSocket updates.
-- Jupiter ingestion is bounded REST polling. The browser WebSocket is an app-level push channel, not a Jupiter feed subscription.
+- Keep the existing Streamlit app available, while using FastAPI and a browser UI for the live monitor. Browser state is delivered using server-sent events.
+- Jupiter ingestion is bounded REST polling. The browser SSE stream is an app-level update channel, not a Jupiter feed subscription.
 - Orderbook candidates are built only for the selected event's supported three-way moneyline. Binary YES/NO orderbook sides are normalized to HOME/DRAW/AWAY using exact event outcome names.
 - Upcoming event discovery stores pre-match prices, enabling same-market baseline checks. Missing baselines fail closed.
 - API-Football fixture matching is user-selected and explicitly verified by team names and kickoff time before statistics can be used.
@@ -31,7 +31,7 @@
 - Normalize Jupiter event `volumeUsd` from the micro-USD integer scale to actual USD at ingestion, and format displayed amounts as whole-dollar currency for scanability.
 - Remove the API-Football setup prompt and fixture-mapping controls from the browser UI while evaluating replacement statistics sources. Do not imply Jupiter includes shots/possession/corners; candidate strategies requiring those inputs stay blocked.
 - Show 🔥 for event volume strictly above US$1M. Show ⭐ only when a monitored event has at least one strategy evaluation in `candidate` status, which means that strategy's trigger and all hard eligibility gates passed.
-- Label the feed near-live/auto-refreshing: Jupiter is polled over REST on a target interval and its upstream score freshness may lag. The browser's WebSocket only transports the app's latest state.
+- Label the feed near-live/auto-refreshing: Jupiter is polled over REST on a target interval and its upstream score freshness may lag. The browser's SSE stream only transports the app's latest state.
 
 ## 2026-11-01 — LiveScore MCP statistics
 

@@ -1,5 +1,4 @@
 const $ = (selector) => document.querySelector(selector);
-let reconnectDelay = 750;
 let statisticsRefreshPending = false;
 
 function esc(value) {
@@ -143,6 +142,10 @@ function renderMatch(selected) {
       "</span></div></article>";
   }).join("");
   const stats = selected.statistics;
+  const drawWarning = (selected.strategy_evaluations || []).find((item) => item.hard_warning);
+  const warningMarkup = drawWarning
+    ? '<div class="notice hard-warning" role="alert">⚠ ' + esc((drawWarning.reasons || []).join(" ")) + '</div>'
+    : "";
   const statsLoading = statisticsRefreshPending || (stats && stats.status === "loading");
   const statsButton = '<button class="stats-refresh" data-refresh-stats="' + esc(selected.event_id) + '"' +
     (statsLoading ? " disabled" : "") + ">" +
@@ -174,7 +177,7 @@ function renderMatch(selected) {
         '</tbody></table></div>'
       : '<div class="stats-empty">' + esc(stats && stats.error || "No match statistics loaded yet.") + '</div>') +
     '</section>';
-  $("#matchPanel").innerHTML = '<div class="match-head"><div><h2 class="match-title">' + esc(selected.title) +
+  $("#matchPanel").innerHTML = warningMarkup + '<div class="match-head"><div><h2 class="match-title">' + esc(selected.title) +
     '</h2><div class="match-subtitle">JUPITER EVENT · ' + esc(selected.event_id) +
     '</div></div><span class="live-badge">● AUTO-REFRESHING</span></div>' +
     '<div class="scoreboard"><div class="score-team"><span>' + esc(selected.home_team) +
@@ -214,11 +217,12 @@ function renderLogs(logs) {
 }
 function render(state) {
   $("#serviceStatus").textContent = state.service && state.service.status || "unknown";
-  $("#pollInterval").textContent = state.service && state.service.poll_seconds
-    ? "Refresh target " + state.service.poll_seconds + "s · REST polling" : "Waiting for first provider update";
+  $("#pollInterval").textContent = state.service && state.service.status === "running"
+    ? "Browser updates via SSE" : "Waiting for monitor service";
   setProvider("#jupiterStatus", state.jupiter && state.jupiter.status);
-  $("#jupiterMeta").textContent = (state.jupiter && state.jupiter.auth || "Provider access") +
-    " · last success " + ageLabel(state.jupiter && state.jupiter.last_success_at);
+  $("#jupiterMeta").textContent = state.jupiter && state.jupiter.last_success_at
+    ? "REST · last update " + ageLabel(state.jupiter.last_success_at)
+    : "REST · awaiting first update";
   const statsProvider = state.livescore_mcp || {};
   setProvider("#statsProviderStatus", statsProvider.status === "on_demand" ? "On demand" : statsProvider.status);
   $("#statsProviderMeta").textContent = statsProvider.last_error ||
@@ -295,23 +299,17 @@ document.addEventListener("click", async (event) => {
   }
 });
 function connect() {
-  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
-  const socket = new WebSocket(scheme + "//" + location.host + "/ws/events");
-  socket.addEventListener("open", () => {
-    reconnectDelay = 750;
+  const source = new EventSource("/api/events");
+  source.addEventListener("open", () => {
     $("#connectionDot").className = "live-dot connected";
-    $("#connectionLabel").textContent = "Screen connected · polling data";
+    $("#connectionLabel").textContent = "Screen connected · streaming updates";
   });
-  socket.addEventListener("message", (message) => {
+  source.addEventListener("message", (message) => {
     try { render(JSON.parse(message.data)); } catch { /* discard malformed update */ }
   });
-  socket.addEventListener("close", () => {
+  source.addEventListener("error", () => {
     $("#connectionDot").className = "live-dot offline";
     $("#connectionLabel").textContent = "Reconnecting";
-    window.setTimeout(connect, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 2, 15000);
   });
-  socket.addEventListener("error", () => socket.close());
 }
-fetch("/api/state").then((response) => response.json()).then(render).catch(() => {});
 connect();

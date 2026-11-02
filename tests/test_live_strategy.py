@@ -102,6 +102,38 @@ def test_underdog_strategy_uses_trailing_team_ask_and_attack_confirmation():
     assert result["status"] == "candidate"
 
 
+def test_favorite_at_75_cents_allows_underdog_ask_up_to_26_cents():
+    now = datetime.now(UTC)
+    data = _inputs(now)
+    home_quote = replace(
+        data.markets["HOME"], bid=Decimal("0.25"), ask=Decimal("0.26"),
+        asks=(AskLevel(Decimal("0.26"), Decimal("100")),),
+    )
+    data = replace(
+        data, home_score=0, away_score=1, home_shots=4,
+        prematch_favorite="AWAY", prematch_favorite_probability=Decimal("0.75"),
+        markets={**data.markets, "HOME": home_quote},
+    )
+    result = next(item for item in evaluate_live_match(data, now=now)
+                  if item["strategy_name"] == "UNDERDOG_SCOUTER" and item["outcome"] == "HOME")
+    assert result["status"] == "candidate"
+
+
+def test_draw_at_30_cents_emits_hard_warning_in_0_0_window():
+    now = datetime.now(UTC)
+    data = _inputs(now)
+    draw_quote = replace(
+        data.markets["DRAW"], bid=Decimal("0.29"), ask=Decimal("0.30"),
+        asks=(AskLevel(Decimal("0.30"), Decimal("100")),),
+    )
+    data = replace(data, markets={**data.markets, "DRAW": draw_quote})
+    result = next(item for item in evaluate_live_match(data, now=now)
+                  if item["strategy_name"] == "DRAW_COMPRESSION")
+    assert result["status"] == "rejected"
+    assert result["hard_warning"] is True
+    assert any("HARD WARNING" in reason for reason in result["reasons"])
+
+
 def test_heavy_favorite_strategy_requires_fresh_independent_prematch_baseline():
     now = datetime.now(UTC)
     data = _inputs(now)
