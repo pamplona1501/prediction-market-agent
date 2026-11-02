@@ -72,10 +72,12 @@ def test_initial_schema_has_expected_tables_and_constraints():
         "events",
         "event_provider_references",
         "strategy_evaluations",
+        "execution_intents",
         "markets",
         "market_outcomes",
         "market_snapshots",
         "match_snapshots",
+        "watchlist_items",
     }
     outcomes = Base.metadata.tables["market_outcomes"]
     assert any(constraint.name == "uq_market_outcomes_market_key" for constraint in outcomes.constraints)

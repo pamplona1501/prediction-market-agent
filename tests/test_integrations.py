@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 
-from integrations.market_data.jupiter import JupiterDataError, JupiterPredictionClient
+from integrations.market_data.jupiter import JupiterDataError, JupiterPredictionClient, _parse_datetime
 from integrations.sports_data.api_football import (
     ApiFootballClient,
     SportsProviderNotConfigured,
@@ -89,6 +89,16 @@ def test_jupiter_list_is_read_only_and_converts_micro_usd():
     assert kwargs["params"]["includeMarkets"] == "false"
     assert kwargs["headers"] == {}
     assert kwargs["timeout"] > 0
+
+
+def test_jupiter_begin_at_parses_unix_seconds_and_milliseconds():
+    expected = datetime(2026, 11, 2, 12, 0, tzinfo=UTC)
+    seconds = str(int(expected.timestamp()))
+    milliseconds = str(int(expected.timestamp() * 1000))
+
+    assert _parse_datetime(seconds) == expected
+    assert _parse_datetime(milliseconds) == expected
+    assert _parse_datetime(int(seconds)) == expected
 
 
 def test_jupiter_soccer_tag_filter_and_live_scores():

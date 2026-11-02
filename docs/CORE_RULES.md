@@ -1,6 +1,6 @@
 # Core Rules
 
-This monitor reports strategy candidates and rejected checks. It is **read-only**: it does not create orders, simulate fills, manage a wallet, or execute trades. A candidate is a rule match for review, not a recommendation or a promise of profit.
+This monitor reports strategy candidates and rejected checks. It does not create orders, simulate fills, manage a wallet, or execute trades. Eligible candidates may create a deduplicated disabled intent audit record; it is diagnostic only. A candidate is a rule match for review, not a recommendation or a promise of profit.
 
 ## Data and safety rules
 
@@ -9,6 +9,7 @@ This monitor reports strategy candidates and rejected checks. It is **read-only*
 - Selecting a match triggers one initial LiveScore statistics fetch; later updates are user-triggered. Accept a provider match only when one unique home/away team pair matches in that order and its detail confirms the teams. Never infer a match from score alone.
 - Missing or ambiguous mapping, inconsistent scores, invalid quotes, or stale/missing observations block candidates. Stats may be shown when the provider score lags, but score inconsistency still blocks eligibility. Never fill gaps with sample or invented live data.
 - The current freshness limit is **90 seconds** for in-play inputs. Jupiter is polled about every **30 seconds**; this is near-real-time monitoring, not a push feed. Browser state updates stream immediately after the monitor publishes a change, but SSE does not make provider data arrive sooner. LiveScore stats do not refresh automatically.
+- The Upcoming radar is a separate **five-minute** Jupiter REST scan, capped at 100 events per refresh. It displays future events with reported event volume of at least **US$100,000** and captures pre-match baseline prices for eligible events within 48 hours. Its favorite and volume badges are observations only: a 75¢ team favorite means Strategy 1's 26¢ ceiling may apply only after kickoff and only if all live rules and gates pass; US$1M event volume does not mean liquidity or a live candidate. Pins persist until removed and never start monitoring.
 
 ## Shared eligibility gates
 

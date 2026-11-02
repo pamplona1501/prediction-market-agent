@@ -53,18 +53,38 @@
           </article>
         </section>
 
-        <section class="workspace">
+        <section class="workspace upcoming-mode">
           <aside class="event-panel panel">
             <div class="panel-heading">
-              <div><span class="section-kicker">JUPITER · LIVE SOCCER</span><h2>In-play events</h2></div>
+              <div><span class="section-kicker">JUPITER · SOCCER</span><h2>Match radar</h2></div>
               <span class="count-badge" id="eventCount">0</span>
             </div>
-            <p class="muted small">🔥 marks Jupiter event volume above US$1M. ⭐ marks a selected match with a strategy candidate passing all eligibility gates.</p>
-            <div class="event-list" id="eventList"><div class="empty-state">Waiting for live events…</div></div>
-            <div class="feed-foot"><span class="pulse"></span><span id="feedUpdated">No provider update yet</span></div>
+            <div class="feed-tabs" role="tablist" aria-label="Match feeds">
+              <button type="button" class="feed-tab active" data-feed-tab="upcoming" role="tab" aria-selected="true">Upcoming <span id="upcomingCount">0</span></button>
+              <button type="button" class="feed-tab" data-feed-tab="live" role="tab" aria-selected="false">In-play <span id="liveCount">0</span></button>
+            </div>
+            <div class="feed-pane" id="livePane" role="tabpanel" hidden>
+              <p class="muted small">🔥 marks event volume above US$1M. ⭐ marks a selected match passing every live eligibility check.</p>
+              <div class="event-list" id="eventList"><div class="empty-state">Waiting for live events…</div></div>
+              <div class="feed-foot"><span class="pulse"></span><span id="feedUpdated">No provider update yet</span></div>
+            </div>
+            <div class="feed-pane" id="upcomingPane" role="tabpanel">
+              <p class="muted small">Future matches · Event volume ≥ US$100,000 · scans up to 100 events every 5 minutes. Pinning does not start monitoring.</p>
+              <div class="radar-status" id="radarStatus">Waiting for first radar scan</div>
+              <div class="event-list" id="upcomingList"><div class="empty-state">Loading upcoming soccer matches…</div></div>
+              <h3 class="watchlist-title">Pinned watchlist</h3>
+              <div class="radar-list" id="watchlistList"><div class="empty-state">No pinned matches.</div></div>
+            </div>
           </aside>
 
           <section class="detail-column">
+            <article class="match-panel panel upcoming-match-panel" id="upcomingMatchPanel">
+              <div class="empty-match">
+                <div class="empty-icon">⌁</div>
+                <h2>Upcoming matches are loading</h2>
+                <p>Jupiter future events load automatically. Select one to inspect its pre-match market quotes; live monitoring remains separate.</p>
+              </div>
+            </article>
             <article class="match-panel panel" id="matchPanel">
               <div class="empty-match">
                 <div class="empty-icon">⌁</div>
@@ -87,7 +107,7 @@
                 <div class="gate waiting"><span class="gate-symbol">·</span><span><b>Executable order-book depth</b><small>Ask-side depth required</small></span></div>
                 <div class="gate waiting"><span class="gate-symbol">·</span><span><b>Signal generation</b><small>Candidate rules remain disabled until inputs pass</small></span></div>
               </div>
-              <div class="strategy-note" id="strategyNote">Monitoring only. Strategy candidates are not orders or recommendations.</div>
+              <div class="strategy-note" id="strategyNote">Eligible candidates create disabled intent audit records. No wallet, order, paper fill, or transaction is created.</div>
               <div class="strategy-results" id="strategyResults"></div>
             </article>
 

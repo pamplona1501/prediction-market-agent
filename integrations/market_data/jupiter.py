@@ -67,6 +67,15 @@ class JupiterEventPage:
     events: tuple[JupiterEvent, ...]
     fetched_at: datetime
     filter_name: str
+    start: int = 0
+    end: int = 0
+    total: int | None = None
+    has_next: bool = False
+
+
+JUPITER_PRIORITY_LIVE = 0
+JUPITER_PRIORITY_SELECTED = 1
+JUPITER_PRIORITY_RADAR = 2
 
 
 @dataclass(frozen=True)
@@ -146,10 +155,28 @@ def _reported_usd(value: Any) -> Decimal | None:
 
 
 def _parse_datetime(value: Any) -> datetime | None:
-    if not isinstance(value, str) or not value:
+    if value is None or isinstance(value, bool):
         return None
+    text = str(value).strip()
+    if not text:
+        return None
+    # Jupiter's Prediction API currently sends beginAt as a string containing
+    # Unix seconds (for example "1793649600"), not an ISO-8601 timestamp.
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        epoch = Decimal(text)
+    except (InvalidOperation, ValueError):
+        epoch = None
+    if epoch is not None and epoch.is_finite():
+        digits = text.lstrip("+-").replace(".", "", 1)
+        if digits.isdigit() and len(digits) >= 9:
+            if abs(epoch) >= Decimal("100000000000"):
+                epoch /= Decimal("1000")
+            try:
+                return datetime.fromtimestamp(float(epoch), tz=UTC)
+            except (OverflowError, OSError, ValueError):
+                return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
     if parsed.tzinfo is None:
@@ -247,7 +274,8 @@ class JupiterPredictionClient:
         self._session = session or requests.Session()
         self._async_client = async_client
         self._owns_async_client = async_client is None
-        self._async_rate_lock = asyncio.Lock()
+        self._async_rate_condition = asyncio.Condition()
+        self._async_waiting_priorities: dict[int, int] = {}
         self._async_last_request = 0.0
         self._timeout_seconds = timeout_seconds
 
@@ -260,17 +288,43 @@ class JupiterPredictionClient:
             await self._async_client.aclose()
             self._async_client = None
 
-    async def _aget_json(self, path: str, params: dict[str, object]) -> Any:
+    async def _acquire_async_request_slot(self, priority: int) -> None:
+        """Reserve the shared rate-limit slot, preferring live requests among waiters."""
+        condition = self._async_rate_condition
+        async with condition:
+            self._async_waiting_priorities[priority] = self._async_waiting_priorities.get(priority, 0) + 1
+            try:
+                while True:
+                    best_priority = min(self._async_waiting_priorities)
+                    wait = _KEYLESS_INTERVAL_SECONDS - (time.monotonic() - self._async_last_request)
+                    if priority == best_priority and (self._async_last_request == 0 or wait <= 0):
+                        self._async_waiting_priorities[priority] -= 1
+                        if not self._async_waiting_priorities[priority]:
+                            del self._async_waiting_priorities[priority]
+                        self._async_last_request = time.monotonic()
+                        condition.notify_all()
+                        return
+                    if wait > 0:
+                        try:
+                            await asyncio.wait_for(condition.wait(), timeout=wait)
+                        except TimeoutError:
+                            pass
+                    else:
+                        await condition.wait()
+            except BaseException:
+                self._async_waiting_priorities[priority] -= 1
+                if not self._async_waiting_priorities[priority]:
+                    del self._async_waiting_priorities[priority]
+                condition.notify_all()
+                raise
+
+    async def _aget_json(self, path: str, params: dict[str, object], *, priority: int = JUPITER_PRIORITY_LIVE) -> Any:
         if self._async_client is None:
             raise JupiterDataError("Jupiter async client is not started.")
-        async with self._async_rate_lock:
-            wait = _KEYLESS_INTERVAL_SECONDS - (time.monotonic() - self._async_last_request)
-            if self._async_last_request and wait > 0:
-                await asyncio.sleep(wait)
-            self._async_last_request = time.monotonic()
         headers = {"x-api-key": self._api_key} if self._api_key else {}
         url = f"{self._base_url}/{path.lstrip('/')}"
         for attempt in range(3):
+            await self._acquire_async_request_slot(priority)
             try:
                 response = await self._async_client.get(url, params=params, headers=headers)
             except httpx.RequestError:
@@ -440,30 +494,55 @@ class JupiterPredictionClient:
     async def alist_sports_events(
         self, *, filter_name: str = "live", limit: int = 20,
         tag: str | None = None, include_markets: bool = False,
+        start: int = 0, sort_by: str | None = None, sort_direction: str | None = None,
+        priority: int = JUPITER_PRIORITY_LIVE,
     ) -> JupiterEventPage:
         if filter_name not in {"live", "upcoming", "trending"}:
             raise ValueError("Unsupported Jupiter event filter")
         if not 1 <= limit <= 50:
             raise ValueError("limit must be between 1 and 50")
+        if start < 0:
+            raise ValueError("start must be non-negative")
+        if sort_by is not None and sort_by not in {"volume", "beginAt"}:
+            raise ValueError("Unsupported Jupiter event sort field")
+        if sort_direction is not None and sort_direction not in {"asc", "desc"}:
+            raise ValueError("Unsupported Jupiter event sort direction")
         params: dict[str, object] = {
             "category": "sports", "filter": filter_name,
             "includeMarkets": "true" if include_markets else "false",
-            "start": 0, "end": limit,
+            "start": start, "end": start + limit,
         }
         if tag:
             if not 1 <= len(tag) <= 48 or not tag.replace("-", "").isalnum():
                 raise ValueError("tag must be a short alphanumeric tag")
             params["tags"] = tag
-        payload = await self._aget_json("events", params)
+        if sort_by:
+            params["sortBy"] = sort_by
+        if sort_direction:
+            params["sortDirection"] = sort_direction
+        payload = await self._aget_json("events", params, priority=priority)
         if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
             raise JupiterDataError("Jupiter response did not match the documented event format.")
         events = tuple(event for raw in payload["data"] if (event := _parse_event(raw)) is not None)
-        return JupiterEventPage(events, datetime.now(UTC), filter_name)
+        pagination = payload.get("pagination") if isinstance(payload.get("pagination"), dict) else {}
+        total = pagination.get("total")
+        try:
+            total = int(total) if total is not None else None
+        except (TypeError, ValueError):
+            total = None
+        has_next = pagination.get("hasNext")
+        if not isinstance(has_next, bool):
+            has_next = len(payload["data"]) == limit
+        return JupiterEventPage(
+            events, datetime.now(UTC), filter_name, start, start + limit, total, has_next,
+        )
 
     async def aget_live_scores(self, event_ids: list[str] | tuple[str, ...]) -> tuple[JupiterLiveScore, ...]:
         if not event_ids or len(event_ids) > 100 or any(not event_id or len(event_id) > 160 for event_id in event_ids):
             raise ValueError("event_ids must contain between 1 and 100 valid provider IDs")
-        payload = await self._aget_json("events/scores", {"eventIds": ",".join(event_ids)})
+        payload = await self._aget_json(
+            "events/scores", {"eventIds": ",".join(event_ids)}, priority=JUPITER_PRIORITY_LIVE,
+        )
         if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
             raise JupiterDataError("Jupiter response did not match the documented live-scores format.")
         return tuple(
@@ -485,7 +564,9 @@ class JupiterPredictionClient:
     async def aget_sports_event_details(self, event_id: str) -> JupiterEvent:
         if not event_id or len(event_id) > 160:
             raise ValueError("event_id must be a non-empty provider ID")
-        payload = await self._aget_json(f"events/{quote(event_id, safe='')}", {})
+        payload = await self._aget_json(
+            f"events/{quote(event_id, safe='')}", {}, priority=JUPITER_PRIORITY_SELECTED,
+        )
         if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
             payload = payload["data"]
         event = _parse_event(payload)
@@ -496,7 +577,9 @@ class JupiterPredictionClient:
     async def aget_orderbook(self, market_id: str) -> JupiterOrderBook:
         if not market_id or len(market_id) > 160:
             raise ValueError("market_id must be a non-empty provider ID")
-        payload = await self._aget_json(f"orderbook/{quote(market_id, safe='')}", {})
+        payload = await self._aget_json(
+            f"orderbook/{quote(market_id, safe='')}", {}, priority=JUPITER_PRIORITY_SELECTED,
+        )
         if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
             payload = payload["data"]
         if not isinstance(payload, dict):

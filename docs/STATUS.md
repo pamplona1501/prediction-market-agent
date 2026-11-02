@@ -1,6 +1,6 @@
 # Project status
 
-Updated: 2026-11-01
+Updated: 2026-11-02
 
 ## Implemented
 
@@ -8,16 +8,17 @@ Updated: 2026-11-01
 - Read-only Jupiter soccer event discovery, live score polling, three-way moneyline orderbook retrieval, and binary YES/NO quote normalization.
 - On-demand LiveScore MCP statistics integration: selecting a match triggers one initial fetch; later updates require a refresh action. Exact team/score matching, a 15-second request cooldown, SQLAlchemy match snapshots and provider references. The prior API-Football adapter is no longer connected to the live monitor.
 - FastAPI live-monitor service and responsive browser UI. Jupiter and LiveScore MCP use lifecycle-managed async HTTP clients; synchronous SQLAlchemy operations run in worker threads. Browser updates stream over Server-Sent Events with bounded per-client queues.
-- Selected-market quote/depth snapshots, match score/stat snapshots, pre-match reference-price observations, and strategy-evaluation audit records in SQLAlchemy. Migration `0005` adds the requested extended match-stat fields.
-- Three candidate-only strategies from the project master specification, with shared fail-closed gates. The service never creates orders, paper positions, signatures, or transactions.
+- Upcoming tab with an independent low-priority five-minute Jupiter scan, US$100,000 minimum event-volume filter, capped 100-event pagination, stale last-good display, favorite and event-volume observations, volume deltas, and a persistent manual watchlist. Pins do not start live monitoring.
+- Selected-market quote/depth snapshots, match score/stat snapshots, pre-match reference-price observations, strategy-evaluation audits, and deduplicated disabled execution-intent audits in SQLAlchemy. Migration `0005` adds extended match statistics; `0006` adds disabled intent records.
+- Three candidate-only strategies from the project master specification, with shared fail-closed gates. Eligible candidates can create a disabled intent audit row. The service never creates orders, paper positions, signatures, or transactions.
 - Tests for strategy rules, quote parsing, persistence, event mapping, and monitor normalization.
 
 ## Runtime behavior and limitations
 
 - Jupiter is queried via REST polling; no supported upstream Prediction API push feed has been identified. Browser updates stream immediately after this app publishes state, but provider data remains near-live at the configured polling cadence.
-- Only the selected in-play event receives detailed orderbook polling. Upcoming soccer events are scanned periodically to collect pre-match reference quotes.
+- Only the selected in-play event receives detailed orderbook polling. Upcoming soccer events are independently scanned every five minutes; Jupiter requests prioritize the live feed and selected-event details ahead of radar requests. The radar lists future events meeting its volume filter from the capped scan, while pre-match reference quotes continue to be captured up to 48 hours before kickoff.
 - The strategy rules need live shots/possession/corners; Jupiter's score API does not provide those fields. Statistics are fetched when a match is selected and become stale under the existing freshness gate. Missing mappings, usable statistics, baseline, freshness, orderbook depth, or another hard gate also block candidates.
-- Candidate results are diagnostic records, not recommendations to execute. Real-money trading remains disabled.
+- Candidate results and intent rows are diagnostics, not recommendations to execute. Real-money trading remains disabled; the broker module has no wallet, signing, RPC, or order-submission path.
 - The browser service currently has no authentication. Keep it bound to loopback for local use; do not expose it to a network without adding authentication and deployment security.
 - The LiveScore MCP hosted free service is described as personal/non-commercial and disallows bulk scraping and automated harvesting; this app only fetches one selected match when requested. Review current terms and data rights before hosting or redistribution.
 
@@ -33,4 +34,4 @@ The legacy Streamlit pages remain available with `python -m streamlit run app.py
 
 ## Verification
 
-`pytest -q` passed (37 tests), including LiveScore MCP name aliases, score-feed lag, all requested stat fields, ambiguous matches, and persistence. Python bytecode compilation, `node --check web/app.js`, and `git diff --check` passed. Migration `0005` passed upgrade, downgrade, and re-upgrade on temporary SQLite. No production/Neon migration or provider write was performed.
+`pytest -q` passed (61 tests; one Starlette TestClient deprecation warning). Python bytecode compilation, `node --check web/app.js`, and `git diff --check` passed. Migration `0007` passed upgrade, downgrade, and re-upgrade on temporary SQLite. No production/Neon migration or provider write was performed.

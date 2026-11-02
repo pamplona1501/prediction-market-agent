@@ -1,5 +1,7 @@
 const $ = (selector) => document.querySelector(selector);
 let statisticsRefreshPending = false;
+let activeFeed = "upcoming";
+let latestState = null;
 
 function esc(value) {
   return String(value == null ? "—" : value).replace(/[&<>"']/g, (ch) => ({
@@ -25,6 +27,13 @@ function localTime(value) {
     hour: "2-digit", minute: "2-digit", second: "2-digit",
   });
 }
+function kickoffLabel(value) {
+  if (!value) return "Time unavailable";
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? esc(value) : parsed.toLocaleString([], {
+    weekday: "short", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+  });
+}
 function ageLabel(value) {
   if (!value) return "not received";
   const age = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1000));
@@ -43,6 +52,7 @@ function setProvider(selector, value) {
 function renderEvents(state) {
   const events = state.events || [];
   $("#eventCount").textContent = String(events.length);
+  $("#liveCount").textContent = String(events.length);
   $("#feedUpdated").textContent = state.jupiter && state.jupiter.last_success_at
     ? "Updated " + localTime(state.jupiter.last_success_at) + " · " + ageLabel(state.jupiter.last_success_at)
     : "No provider update yet";
@@ -68,9 +78,99 @@ function renderEvents(state) {
       '<div class="event-name">' + esc(item.title) + '</div><div class="event-score">' +
       esc(item.score || "—") + '</div><div class="event-teams">' + esc(teams) + '</div>' +
       '<div class="event-vol"><span>JUPITER EVENT VOLUME</span><b>' + usd(item.volume_usd) + "</b></div>" +
+      (item.watched ? '<div class="watched-mark">📌 Pinned <button class="unwatch-btn" data-unwatch="' + esc(item.event_id) + '">Remove</button></div>' : '') +
       '<button class="monitor-btn ' + (selected ? "stop" : "") + '" data-monitor="' +
       esc(item.event_id) + '">' + (selected ? "Monitoring · stop" : "Monitor this match") + "</button></article>";
   }).join("");
+}
+function renderUpcoming(state) {
+  const matches = state.upcoming_matches || [];
+  const watchlist = state.watchlist || [];
+  const radar = state.upcoming_radar || {};
+  $("#upcomingCount").textContent = String(matches.length);
+  $("#radarStatus").textContent = radar.status === "stale"
+    ? "Stale · showing last successful scan from " + ageLabel(radar.last_success_at) + (radar.last_error ? " · " + radar.last_error : "")
+    : radar.status === "error" ? "Radar unavailable · " + (radar.last_error || "waiting for provider")
+      : radar.last_success_at ? "Updated " + ageLabel(radar.last_success_at) + " · scan every " + Math.round((radar.refresh_seconds || 300) / 60) + " min"
+        : "Waiting for first radar scan";
+  $("#radarStatus").className = "radar-status " + (radar.status === "stale" || radar.status === "error" ? "stale" : "");
+  $("#upcomingList").innerHTML = matches.length ? matches.map((item) => {
+    const primed = item.strategy_1_may_apply;
+    const volumePassed = item.volume_gate_met_at_observation;
+    return '<article class="event-card upcoming-event-card ' + (item.selected ? 'selected' : '') + '">' +
+      '<div class="event-card-top"><span class="event-status">UPCOMING</span><span class="event-clock">' +
+      esc(kickoffLabel(item.scheduled_start_at)) + '</span></div>' +
+      '<div class="event-badges">' + (primed ? '<span title="May apply only after kickoff if all live rules and gates pass">⚡ Strategy 1 may apply</span>' : '') +
+      (volumePassed ? '<span title="US$1M event-volume gate met at last observation">🔥 US$1M+</span>' : '') +
+      (item.watched ? '<span class="pinned-badge">📌 Pinned</span>' : '') + '</div>' +
+      '<div class="event-name">' + esc(item.title) + '</div>' +
+      '<div class="upcoming-event-matchup">' + esc(item.home_team || 'Home') + ' · ' + cents(item.home_price) +
+      ' <i>×</i> ' + esc(item.away_team || 'Away') + ' · ' + cents(item.away_price) + '</div>' +
+      '<div class="event-vol"><span>Volume Pre-Match:</span><b>' + usd(item.volume_usd) + '</b></div>' +
+      '<div class="radar-action-row"><button class="monitor-btn view-upcoming-btn" data-select-upcoming="' +
+      esc(item.event_id) + '">' + (item.selected ? 'Viewing details' : 'View match details') + '</button>' +
+      '<button class="watch-btn" data-' + (item.watched ? 'unwatch' : 'watch') + '="' + esc(item.event_id) + '">' +
+      (item.watched ? 'Unpin' : 'Pin') + '</button></div></article>';
+  }).join('') : '<div class="empty-state">' + (radar.last_success_at
+    ? 'No scanned upcoming Jupiter soccer matches have event volume of at least US$100,000.'
+    : radar.status === 'error' ? 'Upcoming events could not be loaded. Check the radar status above.'
+      : 'Loading upcoming Jupiter soccer matches…') + '</div>';
+  const liveIds = new Set((state.events || []).map((row) => row.event_id));
+  const upcomingIds = new Set(matches.map((row) => row.event_id));
+  $("#watchlistList").innerHTML = state.watchlist_status === "unavailable"
+    ? '<div class="empty-state">Watchlist storage is unavailable. Check the database connection and run current migrations.</div>'
+    : watchlist.length ? watchlist.map((row) =>
+    '<div class="watchlist-row"><span><b>' + esc(row.title) + '</b><small>' + esc(localTime(row.scheduled_start_at)) +
+    (liveIds.has(row.event_id) ? ' · in-play' : upcomingIds.has(row.event_id) ? ' · upcoming' : ' · not in current feed') +
+    '</small></span><button class="unwatch-btn" data-unwatch="' + esc(row.event_id) + '">Remove</button></div>'
+  ).join('') : '<div class="empty-state">No pinned matches.</div>';
+}
+function renderUpcomingMatch(selected, state) {
+  if (!selected) {
+    $("#upcomingMatchPanel").innerHTML = '<div class="empty-match"><div class="empty-icon">⌁</div>' +
+      '<h2>Choose an upcoming match</h2><p>Upcoming events load automatically. Select a match to inspect its three-way market prices. This does not start in-play monitoring.</p></div>';
+    return;
+  }
+  if (selected.error && selected.status === "stale") {
+    $("#upcomingMatchPanel").innerHTML = '<div class="notice">' + esc(selected.error) + '</div>' +
+      '<div class="match-head"><div><h2 class="match-title">' + esc(selected.title) +
+      '</h2><div class="match-subtitle">LAST UPCOMING OBSERVATION · ' + esc(selected.event_id) + '</div></div>' +
+      '<span class="upcoming-badge">STALE</span></div>';
+    return;
+  }
+  const watched = (state && state.watchlist || []).some((item) => item.event_id === selected.event_id);
+  const markets = (selected.moneyline || []).map((market) =>
+    '<article class="market-card"><div class="market-card-head"><span>' + esc(market.outcome) +
+    '</span><span>' + esc(market.status || '—') + '</span></div><div class="market-side">' +
+    '<div class="book-cell"><div class="book-label">BUY YES / SELL YES</div><div class="book-price">' +
+    cents(market.buy_yes_usd) + ' <span style="color:#677985;font-size:11px">/</span> ' + cents(market.sell_yes_usd) +
+    '</div><div class="book-depth">Jupiter event-feed quote</div></div><div class="book-cell no">' +
+    '<div class="book-label">BUY NO / SELL NO</div><div class="book-price">' + cents(market.buy_no_usd) +
+    ' <span style="color:#677985;font-size:11px">/</span> ' + cents(market.sell_no_usd) +
+    '</div><div class="book-depth">No orderbook depth in this feed</div></div></div><div class="market-foot">' +
+    '<span>Market volume ' + usd(market.market_volume_usd) + '</span><span>' + esc(market.market_id) +
+    '</span></div></article>'
+  ).join('');
+  const issue = selected.moneyline_complete ? '' : '<div class="empty-state upcoming-mapping-note">' +
+    (selected.moneyline_gate_reasons || []).map(esc).join(' ') + '</div>';
+  $("#upcomingMatchPanel").innerHTML = '<div class="match-head"><div><h2 class="match-title">' + esc(selected.title) +
+    '</h2><div class="match-subtitle">JUPITER EVENT · ' + esc(selected.event_id) + '</div></div>' +
+    '<span class="upcoming-badge">● UPCOMING</span></div>' +
+    '<div class="scoreboard upcoming-scoreboard"><div class="score-team"><span>' + esc(selected.home_team || 'Home team') +
+    '</span></div><div><div class="kickoff-date">' + esc(kickoffLabel(selected.scheduled_start_at)) +
+    '</div><div class="score-status">KICKOFF</div></div><div class="score-team"><span>' +
+    esc(selected.away_team || 'Away team') + '</span></div></div>' +
+    '<div class="metric-row"><div class="mini-metric"><span>Event volume</span><b>' + usd(selected.event_volume_usd) +
+    '</b></div><div class="mini-metric"><span>Three-way moneyline</span><b>' +
+    (selected.moneyline_complete ? '3 / 3' : (selected.moneyline || []).length + ' / 3') +
+    '</b></div><div class="mini-metric"><span>Market data</span><b>Jupiter feed</b></div>' +
+    '<div class="mini-metric"><span>Last update</span><b>' + ageLabel(selected.fetched_at) + '</b></div></div>' +
+    '<div class="subheading"><h3>Three-way moneyline · market quotes</h3><span>PRE-MATCH DATA</span></div>' +
+    (markets ? '<div class="market-grid">' + markets + '</div>' : issue) + issue +
+    '<div class="match-actions"><span>' + esc(selected.market_source || 'Jupiter upcoming market feed') +
+    '</span><button class="watch-btn" data-' + (watched ? 'unwatch' : 'watch') + '="' + esc(selected.event_id) + '">' +
+    (watched ? '📌 Remove pin' : 'Pin match') + '</button></div>' +
+    '<p class="match-data-note">This future-match view is separate from in-play monitoring. Quotes update with the five-minute upcoming scan; no monitoring, orders, or trading are started here.</p>';
 }
 function renderGates(selected) {
   const evaluations = selected && selected.strategy_evaluations || [];
@@ -90,7 +190,7 @@ function renderGates(selected) {
       selected ? (dataGates.fresh_data && dataGates.score_consistent ? "All source timestamps within configured age" : "One or more source freshness or score checks failed") : "Waiting for current provider timestamps"],
     ["Executable order-book depth", !!(selected && (selected.moneyline || []).some((m) => Number(m.orderbook && m.orderbook.yes_ask_depth_usd || 0) > 0)),
       selected ? "Book loaded; strategy-specific minimum still applies" : "Ask-side depth required"],
-    ["Candidate rules", candidates.length > 0, candidates.length ? candidates.length + " candidate(s) · no orders submitted" : "No candidate passes the complete rules and shared gates"],
+    ["Candidate rules", candidates.length > 0, candidates.length ? candidates.length + " candidate(s) · execution disabled" : "No candidate passes the complete rules and shared gates"],
   ];
   $("#gateGrid").innerHTML = gates.map((gate) =>
     '<div class="gate ' + (selected ? (gate[1] ? "pass" : "fail") : "waiting") + '">' +
@@ -98,12 +198,13 @@ function renderGates(selected) {
     "<span><b>" + esc(gate[0]) + "</b><small>" + esc(gate[2]) + "</small></span></div>"
   ).join("");
   $("#strategyNote").textContent = selected
-    ? "Candidate-only evaluation is active. A candidate is informational; it is not a paper fill, order, or recommendation. Real-money execution is disabled."
+    ? "Eligible candidates create a disabled execution-intent audit record. No wallet, order, paper fill, or transaction is created."
     : "Monitoring only. Strategy candidates are not orders or recommendations.";
   const resultsNode = $("#strategyResults");
   resultsNode.innerHTML = evaluations.length ? evaluations.map((item) =>
     '<div class="strategy-result ' + esc(item.status) + '"><span><b>' + esc(item.strategy_name.replaceAll("_", " ")) +
     ' · ' + esc(item.outcome) + '</b><small>' + esc((item.reasons || []).join(" ") || "All current gates passed.") +
+    (item.execution_intent ? '<br>Intent: ' + esc(item.execution_intent.status) + ' · ' + esc(item.execution_intent.audit_status || item.execution_intent.reason || "") : "") +
     '</small></span><strong>' + esc(item.status) + '</strong></div>'
   ).join("") : "";
 }
@@ -216,6 +317,7 @@ function renderLogs(logs) {
   ).join("") : '<div class="empty-state">Monitor events will appear here.</div>';
 }
 function render(state) {
+  latestState = state;
   $("#serviceStatus").textContent = state.service && state.service.status || "unknown";
   $("#pollInterval").textContent = state.service && state.service.status === "running"
     ? "Browser updates via SSE" : "Waiting for monitor service";
@@ -229,7 +331,11 @@ function render(state) {
     (statsProvider.last_success_at ? "Last selected-match response " + ageLabel(statsProvider.last_success_at) :
       "Fetched only when requested for the selected match");
   renderEvents(state);
+  renderUpcoming(state);
+  $("#eventCount").textContent = String(activeFeed === "upcoming"
+    ? (state.upcoming_matches || []).length : (state.events || []).length);
   renderMatch(state.selected_event);
+  renderUpcomingMatch(state.selected_upcoming_event, state);
   renderLogs(state.logs);
   const errors = [state.jupiter && state.jupiter.last_error].filter(Boolean);
   $("#topNotice").textContent = errors.join(" ");
@@ -243,6 +349,14 @@ async function requestMonitor(eventId) {
   if (!response.ok) {
     const error = await response.json().catch(() => ({}));
     throw new Error(error.detail || "Monitor request failed (" + response.status + ")");
+  }
+  render(await response.json());
+}
+async function requestUpcomingDetails(eventId) {
+  const response = await fetch("/api/upcoming/" + encodeURIComponent(eventId) + "/select", { method: "POST" });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error.detail || "Upcoming match details could not be loaded (" + response.status + ")");
   }
   render(await response.json());
 }
@@ -268,6 +382,49 @@ async function requestStatistics(eventId, retryCooldown = true) {
   render(await response.json());
 }
 document.addEventListener("click", async (event) => {
+  const tab = event.target.closest("[data-feed-tab]");
+  if (tab) {
+    activeFeed = tab.dataset.feedTab;
+    document.querySelectorAll("[data-feed-tab]").forEach((button) => {
+      const active = button === tab;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-selected", String(active));
+    });
+    $("#livePane").hidden = tab.dataset.feedTab !== "live";
+    $("#upcomingPane").hidden = tab.dataset.feedTab !== "upcoming";
+    $(".workspace").classList.toggle("upcoming-mode", activeFeed === "upcoming");
+    $("#eventCount").textContent = String(activeFeed === "upcoming"
+      ? ((latestState && latestState.upcoming_matches) || []).length
+      : ((latestState && latestState.events) || []).length);
+    return;
+  }
+  const watch = event.target.closest("[data-watch]");
+  const unwatch = event.target.closest("[data-unwatch]");
+  const viewUpcoming = event.target.closest("[data-select-upcoming]");
+  if (viewUpcoming) {
+    try {
+      await requestUpcomingDetails(viewUpcoming.dataset.selectUpcoming);
+    } catch (error) {
+      $("#topNotice").textContent = error.message;
+      $("#topNotice").hidden = false;
+    }
+    return;
+  }
+  if (watch || unwatch) {
+    const id = (watch || unwatch).dataset[watch ? "watch" : "unwatch"];
+    try {
+      const response = await fetch("/api/watchlist/" + encodeURIComponent(id), { method: watch ? "POST" : "DELETE" });
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.detail || "Watchlist update failed (" + response.status + ")");
+      }
+      render(await response.json());
+    } catch (error) {
+      $("#topNotice").textContent = error.message;
+      $("#topNotice").hidden = false;
+    }
+    return;
+  }
   const refreshStats = event.target.closest("[data-refresh-stats]");
   const start = event.target.closest("[data-monitor]");
   const stop = event.target.closest("[data-stop]");

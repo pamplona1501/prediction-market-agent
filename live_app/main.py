@@ -58,12 +58,39 @@ def create_app(monitor: LiveMonitor | None = None) -> FastAPI:
             "database": "connected" if available else "unavailable",
             "database_detail": detail,
             "execution": "disabled",
+            "execution_detail": "Eligible strategy candidates may be audited as disabled intents; no wallet or transaction path exists.",
         }
 
     @app.post("/api/monitor")
     async def set_monitor(request: MonitorRequest) -> dict[str, Any]:
         try:
             await service.monitor_event(request.event_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from None
+        return service.snapshot()
+
+    @app.post("/api/watchlist/{event_id}")
+    async def add_watchlist_item(event_id: str) -> dict[str, Any]:
+        try:
+            await service.watch_event(event_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from None
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from None
+        return service.snapshot()
+
+    @app.delete("/api/watchlist/{event_id}")
+    async def remove_watchlist_item(event_id: str) -> dict[str, Any]:
+        try:
+            await service.unwatch_event(event_id)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from None
+        return service.snapshot()
+
+    @app.post("/api/upcoming/{event_id}/select")
+    async def select_upcoming_event(event_id: str) -> dict[str, Any]:
+        try:
+            await service.select_upcoming_event(event_id)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from None
         return service.snapshot()

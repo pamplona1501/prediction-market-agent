@@ -10,10 +10,18 @@ from decimal import Decimal
 import os
 import re
 import time
+import unicodedata
 from typing import Any
 
-from integrations.market_data.capture import persist_event_snapshot, persist_prematch_event, persist_strategy_audit
+from integrations.market_data.capture import (
+    persist_event_snapshot,
+    persist_execution_intents,
+    persist_prematch_event,
+    persist_strategy_audit,
+)
 from integrations.market_data.jupiter import (
+    JUPITER_PRIORITY_LIVE,
+    JUPITER_PRIORITY_RADAR,
     JupiterDataError,
     JupiterEvent,
     JupiterLiveScore,
@@ -27,9 +35,20 @@ from database.provider_mapping import (
     livescore_mcp_mapping_status,
 )
 from database.snapshots import read_prematch_yes_prices
+from database.watchlist import add_event as add_watchlist_event
+from database.watchlist import read_watchlist as read_saved_watchlist
+from database.watchlist import remove_event as remove_watchlist_event
 from sqlalchemy.orm import Session
 from integrations.sports_data.livescore_mcp import LiveScoreMCPClient, LiveScoreMCPError, MatchStatistics
 from strategies.live import AskLevel, CandidateConfig, MarketQuote, MatchInputs, evaluate_live_match
+from engine.execution.jupiter_broker import (
+    MAXIMUM_SLIPPAGE_BPS,
+    MINIMUM_ORDER_USD,
+    ExecutionTicket,
+    JupiterBrokerEngine,
+)
+
+UPCOMING_MIN_VOLUME_USD = Decimal("100000")
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -58,6 +77,44 @@ def _exclude_suspended_events(
         if _is_suspended(score.status) or _is_suspended(score.period)
     }
     return tuple(event for event in events if event.event_id not in suspended_ids), suspended_ids
+
+
+def _normalize_team_label(value: str) -> str:
+    ascii_text = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", " ", ascii_text.casefold()).strip()
+
+
+def _classify_upcoming_moneyline(event: JupiterEvent) -> tuple[dict[str, JupiterMarket], list[str], str | None, str | None]:
+    """Map a future event's three moneyline quotes from its title and market labels."""
+    teams = re.split(r"\s+(?:vs?\.?|@)\s+", event.title, maxsplit=1, flags=re.IGNORECASE)
+    if len(teams) != 2:
+        return {}, ["Could not identify home and away teams from the Jupiter event title."], None, None
+    home_team, away_team = (part.strip() for part in teams)
+    home_key, away_key = _normalize_team_label(home_team), _normalize_team_label(away_team)
+    if not home_key or not away_key or home_key == away_key:
+        return {}, ["Jupiter event title does not identify two distinct teams."], home_team, away_team
+
+    assigned: dict[str, JupiterMarket] = {}
+    for market in event.markets:
+        if market.sports_market_type != "moneyline":
+            continue
+        title_key = _normalize_team_label(market.title)
+        team_key = _normalize_team_label(market.team_name or "")
+        if title_key in {"draw", "tie", "x"} or team_key in {"draw", "tie", "x"}:
+            outcome = "DRAW"
+        elif team_key == home_key or (not team_key and title_key == home_key):
+            outcome = "HOME"
+        elif team_key == away_key or (not team_key and title_key == away_key):
+            outcome = "AWAY"
+        else:
+            continue
+        if outcome in assigned:
+            return {}, [f"Multiple upcoming moneyline contracts matched {outcome}; mapping is ambiguous."], home_team, away_team
+        assigned[outcome] = market
+
+    missing = sorted({"HOME", "DRAW", "AWAY"} - assigned.keys())
+    reasons = [f"Missing upcoming moneyline outcome: {outcome}." for outcome in missing]
+    return assigned, reasons, home_team, away_team
 
 
 def _parse_time(value: str | None) -> datetime | None:
@@ -139,6 +196,7 @@ class LiveMonitor:
         poll_seconds: float | None = None,
         prematch_refresh_seconds: float = 300.0,
         persist=persist_event_snapshot,
+        broker: JupiterBrokerEngine | None = None,
     ) -> None:
         self.jupiter = jupiter or JupiterPredictionClient.from_environment()
         self.livescore_mcp = livescore_mcp or LiveScoreMCPClient()
@@ -146,16 +204,20 @@ class LiveMonitor:
         self.poll_seconds = min(max(self.poll_seconds, 15.0), 300.0)
         self.prematch_refresh_seconds = prematch_refresh_seconds
         self.persist = persist
+        self.broker = broker or JupiterBrokerEngine()
         self.selected_event_id: str | None = None
         self._task: asyncio.Task[None] | None = None
+        self._upcoming_task: asyncio.Task[None] | None = None
+        self._upcoming_initial_scan = asyncio.Event()
         self._stats_autofetch_task: asyncio.Task[None] | None = None
         self._wake = asyncio.Event()
         self._stopping = asyncio.Event()
         self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
         self._logs: deque[dict[str, str]] = deque(maxlen=100)
         self._last_fixture_poll = 0.0
-        self._last_prematch_poll = 0.0
+        self._previous_upcoming_volumes: dict[str, Decimal] = {}
         self._last_score_by_id: dict[str, JupiterLiveScore] = {}
+        self._upcoming_event_cache: dict[str, JupiterEvent] = {}
         self._last_manual_stats_refresh: float | None = None
         self._refresh_lock = asyncio.Lock()
         self.state: dict[str, Any] = {
@@ -173,6 +235,16 @@ class LiveMonitor:
             },
             "events": [],
             "prematch_baselines": {"status": "waiting", "last_capture_at": None},
+            "upcoming_matches": [],
+            "selected_upcoming_event": None,
+            "upcoming_radar": {
+                "status": "starting",
+                "last_success_at": None,
+                "last_error": None,
+                "refresh_seconds": self.prematch_refresh_seconds,
+            },
+            "watchlist": [],
+            "watchlist_status": "starting",
             "selected_event_id": None,
             "selected_event": None,
             "logs": [],
@@ -184,8 +256,19 @@ class LiveMonitor:
             await self.jupiter.open()
             await self.livescore_mcp.open()
             self._stopping.clear()
+            self._upcoming_initial_scan.clear()
             self._task = asyncio.create_task(self._run(), name="live-match-monitor")
+            self._upcoming_task = asyncio.create_task(
+                self._run_upcoming_radar(), name="upcoming-match-radar",
+            )
+            await self._refresh_watchlist()
+            self._apply_watchlist_flags()
             self._wake.set()
+            try:
+                await asyncio.wait_for(self._upcoming_initial_scan.wait(), timeout=20.0)
+            except TimeoutError:
+                self._log("warning", "Upcoming radar has not completed its initial scan yet; it will continue in the background.")
+                await self._publish()
 
     async def stop(self) -> None:
         self._stopping.set()
@@ -197,6 +280,9 @@ class LiveMonitor:
         if self._task:
             await self._task
             self._task = None
+        if self._upcoming_task:
+            await self._upcoming_task
+            self._upcoming_task = None
         await self.jupiter.close()
         await self.livescore_mcp.close()
 
@@ -213,6 +299,102 @@ class LiveMonitor:
 
     def unsubscribe(self, queue: asyncio.Queue[dict[str, Any]]) -> None:
         self._subscribers.discard(queue)
+
+    async def watch_event(self, event_id: str) -> None:
+        if not any(row.get("event_id") == event_id for row in self.state.get("upcoming_matches", [])):
+            raise ValueError("Select an upcoming match from the current radar list.")
+        try:
+            await asyncio.to_thread(add_watchlist_event, event_id)
+        except (RuntimeError, ValueError):
+            raise
+        await self._refresh_watchlist()
+        self._apply_watchlist_flags()
+        await self._publish()
+
+    async def unwatch_event(self, event_id: str) -> None:
+        try:
+            await asyncio.to_thread(remove_watchlist_event, event_id)
+        except RuntimeError:
+            raise
+        await self._refresh_watchlist()
+        self._apply_watchlist_flags()
+        await self._publish()
+
+    async def select_upcoming_event(self, event_id: str) -> None:
+        """Show a future event's cached Jupiter markets without starting live monitoring."""
+        if not any(row.get("event_id") == event_id for row in self.state.get("upcoming_matches", [])):
+            raise ValueError("Select an upcoming match from the current radar list.")
+        event = self._upcoming_event_cache.get(event_id)
+        if event is None:
+            raise ValueError("Upcoming market details are refreshing. Select the match again shortly.")
+        self.state = {
+            **self.state,
+            "selected_upcoming_event": self._upcoming_detail_view(event),
+        }
+        self._apply_watchlist_flags()
+        self._log("info", f"Opened upcoming market details for {event.title}; live monitoring was not started.")
+        await self._publish()
+
+    def _upcoming_detail_view(self, event: JupiterEvent) -> dict[str, Any]:
+        assigned, reasons, home_team, away_team = _classify_upcoming_moneyline(event)
+        market_rows = []
+        for outcome in ("HOME", "DRAW", "AWAY"):
+            market = assigned.get(outcome)
+            if market is None:
+                continue
+            market_rows.append({
+                "outcome": outcome,
+                "market_id": market.market_id,
+                "title": market.title,
+                "team": market.team_name,
+                "status": market.status,
+                "market_volume_usd": _decimal(market.volume_usd),
+                "buy_yes_usd": _decimal(market.buy_yes_usd),
+                "sell_yes_usd": _decimal(market.sell_yes_usd),
+                "buy_no_usd": _decimal(market.buy_no_usd),
+                "sell_no_usd": _decimal(market.sell_no_usd),
+            })
+        return {
+            "event_id": event.event_id,
+            "title": event.title,
+            "home_team": home_team,
+            "away_team": away_team,
+            "scheduled_start_at": _iso(event.scheduled_start_at),
+            "event_volume_usd": _decimal(event.reported_volume_usd),
+            "fetched_at": self.state.get("upcoming_radar", {}).get("last_success_at"),
+            "moneyline_complete": not reasons,
+            "moneyline_gate_reasons": reasons,
+            "moneyline": market_rows,
+            "market_detail_count": len(event.markets),
+            "market_source": "Jupiter upcoming event feed · refreshes every five minutes",
+            "status": "healthy" if not reasons and len(market_rows) == 3 else "partial",
+        }
+
+    async def _refresh_watchlist(self) -> None:
+        try:
+            rows = await asyncio.to_thread(read_saved_watchlist)
+        except RuntimeError:
+            self.state = {**self.state, "watchlist_status": "unavailable"}
+            return
+        self.state = {
+            **self.state,
+            "watchlist": rows,
+            "watchlist_status": "healthy",
+        }
+
+    def _apply_watchlist_flags(self) -> None:
+        watched = {row.get("event_id") for row in self.state.get("watchlist", [])}
+        selected_upcoming_id = (self.state.get("selected_upcoming_event") or {}).get("event_id")
+        events = [
+            {**row, "watched": row.get("event_id") in watched}
+            for row in self.state.get("events", [])
+        ]
+        upcoming = [
+            {**row, "watched": row.get("event_id") in watched,
+             "selected": row.get("event_id") == selected_upcoming_id}
+            for row in self.state.get("upcoming_matches", [])
+        ]
+        self.state = {**self.state, "events": events, "upcoming_matches": upcoming}
 
     def _log(self, level: str, message: str) -> None:
         self._logs.appendleft({"at": datetime.now(UTC).isoformat(), "level": level, "message": message})
@@ -333,6 +515,7 @@ class LiveMonitor:
                 }
                 selected["fixture_mapping"] = mapping
                 evaluations, audit_input = self._evaluate_selected(score, selected, mapping)
+                await self._process_candidate_intents(event_id, selected, evaluations)
                 selected["strategy_evaluations"] = evaluations
                 selected["data_gates"] = evaluations[0]["gate_results"] if evaluations else {}
                 selected["statistics"]["persistence"] = "saved" if stored else "unavailable"
@@ -499,7 +682,7 @@ class LiveMonitor:
                 "selected_event_id": self.selected_event_id,
             }
             self._log("info", f"Jupiter refresh: {len(event_rows)} live soccer events; suspended matches hidden.")
-            await self._poll_upcoming_baselines()
+            self._apply_watchlist_flags()
 
             if self.selected_event_id and self.selected_event_id in visible_score_by_id:
                 await self._refresh_selected(visible_events, visible_score_by_id[self.selected_event_id])
@@ -644,6 +827,7 @@ class LiveMonitor:
             }
         selected_view["fixture_mapping"] = mapping
         evaluations, audit_input = self._evaluate_selected(score, selected_view, mapping)
+        await self._process_candidate_intents(event_id, selected_view, evaluations)
         selected_view["strategy_evaluations"] = evaluations
         audit_saved, audit_rows = await asyncio.to_thread(
             persist_strategy_audit,
@@ -658,6 +842,83 @@ class LiveMonitor:
             "info" if result.persisted else "warning",
             f"Monitored {event.title}: {len(market_rows)} moneyline outcomes; snapshot storage {selected_view['persistence']}.",
         )
+
+    async def _process_candidate_intents(
+        self,
+        event_id: str,
+        selected: dict[str, Any],
+        evaluations: list[dict[str, object]],
+    ) -> None:
+        """Create audit-only tickets for candidates with an exact market mapping."""
+        rows = selected.get("moneyline") or []
+        tickets: list[ExecutionTicket] = []
+        candidate_evaluations = [row for row in evaluations if row.get("status") == "candidate"]
+        for evaluation in candidate_evaluations:
+            outcome = str(evaluation.get("outcome") or "")
+            market_id = evaluation.get("market_id")
+            mapped_rows = [
+                row for row in rows
+                if row.get("outcome") == outcome and row.get("market_id") == market_id
+            ]
+            if len(mapped_rows) != 1:
+                evaluation["execution_intent"] = {
+                    "status": "rejected",
+                    "reason": "Candidate does not map to exactly one selected Jupiter moneyline market.",
+                }
+                continue
+            row = mapped_rows[0]
+            orderbook = row.get("orderbook") or {}
+            ask_value = orderbook.get("yes_ask")
+            if ask_value is None:
+                evaluation["execution_intent"] = {
+                    "status": "rejected",
+                    "reason": "Selected Jupiter market has no verified YES ask.",
+                }
+                continue
+            try:
+                if evaluation.get("ask") is None or Decimal(str(evaluation["ask"])) != Decimal(str(ask_value)):
+                    raise ValueError("Candidate ask does not match the selected market's current YES ask.")
+                ticket = ExecutionTicket(
+                    event_id=event_id,
+                    market_id=str(market_id),
+                    strategy_name=str(evaluation["strategy_name"]),
+                    outcome=outcome,
+                    contract_side="YES",
+                    ask_price=Decimal(str(ask_value)),
+                    size_usd=MINIMUM_ORDER_USD,
+                    max_slippage_bps=MAXIMUM_SLIPPAGE_BPS,
+                    observed_at=_parse_time(orderbook.get("fetched_at")) or datetime.now(UTC),
+                )
+                result = await self.broker.process_candidate(ticket)
+            except (KeyError, TypeError, ValueError) as exc:
+                evaluation["execution_intent"] = {
+                    "status": "rejected",
+                    "reason": str(exc),
+                }
+                continue
+            evaluation["execution_intent"] = {
+                "status": result.status,
+                "reason": result.reason,
+                "audit_status": "pending",
+            }
+            tickets.append(ticket)
+
+        if tickets:
+            saved, count = await asyncio.to_thread(persist_execution_intents, event_id, tickets)
+            audit_status = "saved" if saved else "unavailable"
+            for evaluation in candidate_evaluations:
+                intent = evaluation.get("execution_intent")
+                if isinstance(intent, dict) and intent.get("status") == "disabled":
+                    intent["audit_status"] = audit_status
+                    intent["audit_rows_written"] = count if saved else 0
+        selected["execution_intents"] = [
+            {
+                "strategy_name": str(evaluation.get("strategy_name")),
+                "outcome": str(evaluation.get("outcome")),
+                **(evaluation.get("execution_intent") or {}),
+            }
+            for evaluation in candidate_evaluations
+        ]
 
     def _evaluate_selected(
         self,
@@ -824,30 +1085,62 @@ class LiveMonitor:
             "observed_at": _iso(observed_at),
         }
 
-    async def _poll_upcoming_baselines(self) -> None:
-        if time.monotonic() - self._last_prematch_poll < self.prematch_refresh_seconds:
-            return
-        self._last_prematch_poll = time.monotonic()
-        try:
-            page = await self.jupiter.alist_sports_events(
-                filter_name="upcoming",
-                limit=20,
-                tag="soccer",
-                include_markets=True,
-            )
-        except JupiterDataError as exc:
-            self.state = {
-                **self.state,
-                "prematch_baselines": {"status": "error", "last_capture_at": None, "last_error": str(exc)},
-            }
-            self._log("warning", f"Upcoming baseline feed failed: {exc}")
-            return
+    async def _run_upcoming_radar(self) -> None:
+        """Refresh the lower-priority upcoming feed independently from live monitoring."""
+        while not self._stopping.is_set():
+            cycle_started = time.monotonic()
+            try:
+                await self._refresh_upcoming_radar_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                radar = dict(self.state.get("upcoming_radar", {}))
+                radar.update(
+                    status="stale" if radar.get("last_success_at") else "error",
+                    last_error="Unexpected error while refreshing upcoming matches.",
+                )
+                self.state = {**self.state, "upcoming_radar": radar}
+                self._log("warning", "Upcoming radar refresh failed unexpectedly; the last good data is retained.")
+                await self._publish()
+            finally:
+                self._upcoming_initial_scan.set()
+            delay = max(0.1, self.prematch_refresh_seconds - (time.monotonic() - cycle_started))
+            try:
+                await asyncio.wait_for(self._stopping.wait(), timeout=delay)
+            except TimeoutError:
+                pass
+
+    async def _refresh_upcoming_radar_once(self) -> None:
         now = datetime.now(UTC)
-        stored = 0
-        unavailable = 0
-        for event in page.events:
-            start = event.scheduled_start_at
-            if start is None or not now < start <= now + timedelta(hours=48):
+        events: dict[str, JupiterEvent] = {}
+        try:
+            # At most 100 events per scan, keeping the radar within a fixed request budget.
+            for start in (0, 50):
+                page = await self.jupiter.alist_sports_events(
+                    filter_name="upcoming", limit=50, start=start, tag="soccer",
+                    include_markets=True, sort_by="volume", sort_direction="desc",
+                    priority=JUPITER_PRIORITY_RADAR,
+                )
+                for event in page.events:
+                    events[event.event_id] = event
+                if not page.has_next or len(page.events) < 50:
+                    break
+        except JupiterDataError as exc:
+            radar = dict(self.state.get("upcoming_radar", {}))
+            radar.update(status="stale" if radar.get("last_success_at") else "error", last_error=str(exc))
+            self.state = {**self.state, "upcoming_radar": radar}
+            self._log("warning", f"Upcoming radar refresh failed: {exc}")
+            await self._publish()
+            return
+
+        previous = self._previous_upcoming_volumes
+        rows: list[dict[str, Any]] = []
+        next_volumes: dict[str, Decimal] = {}
+        stored = unavailable = 0
+        baseline_cutoff = now + timedelta(hours=48)
+        for event in events.values():
+            start_at = event.scheduled_start_at
+            if start_at is None or not now < start_at <= baseline_cutoff:
                 continue
             if not any(market.sports_market_type == "moneyline" for market in event.markets):
                 continue
@@ -856,14 +1149,88 @@ class LiveMonitor:
                 stored += result.snapshots_written
             else:
                 unavailable += 1
-        status = "saved" if stored else "unavailable" if unavailable else "no_eligible_events"
+        for event in events.values():
+            start_at = event.scheduled_start_at
+            if start_at is None or start_at <= now:
+                continue
+            volume = event.reported_volume_usd
+            if volume is not None:
+                next_volumes[event.event_id] = volume
+            if volume is None or volume < UPCOMING_MIN_VOLUME_USD:
+                continue
+            team_markets = [
+                market for market in event.markets
+                if market.sports_market_type == "moneyline" and market.team_name
+                and market.title.strip().casefold() not in {"draw", "tie", "x"}
+            ]
+            draw_markets = [
+                market for market in event.markets
+                if market.sports_market_type == "moneyline"
+                and (market.title.strip().casefold() in {"draw", "tie", "x"}
+                     or (market.team_name or "").strip().casefold() in {"draw", "tie", "x"})
+            ]
+            priced_teams = [m for m in team_markets if m.buy_yes_usd is not None]
+            favorite = max(priced_teams, key=lambda market: market.buy_yes_usd) if priced_teams else None
+            draw = max((m for m in draw_markets if m.buy_yes_usd is not None),
+                       key=lambda market: market.buy_yes_usd, default=None)
+            assignments, _, home_team, away_team = _classify_upcoming_moneyline(event)
+            home_market, away_market = assignments.get("HOME"), assignments.get("AWAY")
+            delta = volume - previous[event.event_id] if volume is not None and event.event_id in previous else None
+            rows.append({
+                "event_id": event.event_id, "title": event.title,
+                "scheduled_start_at": _iso(start_at), "volume_usd": _decimal(volume),
+                "volume_delta_usd": _decimal(delta),
+                "home_team": home_team, "home_price": _decimal(home_market.buy_yes_usd) if home_market else None,
+                "away_team": away_team, "away_price": _decimal(away_market.buy_yes_usd) if away_market else None,
+                "favorite_team": favorite.team_name if favorite else None,
+                "favorite_price": _decimal(favorite.buy_yes_usd) if favorite else None,
+                "draw_price": _decimal(draw.buy_yes_usd) if draw else None,
+                "strategy_1_may_apply": bool(favorite and favorite.buy_yes_usd >= Decimal("0.75")),
+                "volume_gate_met_at_observation": bool(volume is not None and volume >= Decimal("1000000")),
+            })
+        rows.sort(key=lambda row: (-Decimal(row["volume_usd"] or "0"), row["scheduled_start_at"] or ""))
+        self._previous_upcoming_volumes = next_volumes
+        watched = {item.get("event_id") for item in self.state.get("watchlist", [])}
+        rows = [{**row, "watched": row["event_id"] in watched} for row in rows]
+        success_at = now.isoformat()
+        radar_status = "saved" if stored else "unavailable" if unavailable else "healthy"
+        self._upcoming_event_cache = {
+            event.event_id: event for event in events.values()
+            if event.scheduled_start_at is not None and event.scheduled_start_at > now
+        }
         self.state = {
             **self.state,
+            "upcoming_matches": rows,
+            "upcoming_radar": {
+                "status": "healthy", "last_success_at": success_at, "last_error": None,
+                "refresh_seconds": self.prematch_refresh_seconds,
+                "events_seen": len(events), "page_cap": 100,
+            },
             "prematch_baselines": {
-                "status": status,
-                "last_capture_at": now.isoformat(),
-                "events_seen": len(page.events),
-                "snapshot_rows_written": stored,
+                "status": radar_status, "last_capture_at": success_at,
+                "events_seen": len(events), "snapshot_rows_written": stored,
             },
         }
-        self._log("info", f"Prematch scan: stored {stored} moneyline YES/NO observations from upcoming soccer events.")
+        selected_upcoming = self.state.get("selected_upcoming_event") or {}
+        selected_upcoming_id = selected_upcoming.get("event_id")
+        if selected_upcoming_id:
+            refreshed_event = self._upcoming_event_cache.get(selected_upcoming_id)
+            if refreshed_event is not None:
+                self.state = {
+                    **self.state,
+                    "selected_upcoming_event": self._upcoming_detail_view(refreshed_event),
+                }
+            else:
+                self.state = {
+                    **self.state,
+                    "selected_upcoming_event": {
+                        **selected_upcoming, "status": "stale",
+                        "error": "Kickoff passed or Jupiter no longer returns this event as upcoming.",
+                    },
+                }
+        self._apply_watchlist_flags()
+        self._log(
+            "info",
+            f"Upcoming radar refresh: {len(rows)} future matches with event volume at least US$100,000; {len(events)} events scanned.",
+        )
+        await self._publish()

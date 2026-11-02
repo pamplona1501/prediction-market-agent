@@ -1,4 +1,4 @@
-"""Initial persistent reference and observation schema (no execution tables)."""
+"""Persistent provider observations, candidate audits, and disabled intent audits."""
 
 from datetime import datetime
 from decimal import Decimal
@@ -134,6 +134,47 @@ class StrategyEvaluation(Base):
         CheckConstraint("status IN ('candidate', 'rejected')", name="ck_strategy_evaluations_status"),
         CheckConstraint("outcome_key IN ('HOME', 'DRAW', 'AWAY')", name="ck_strategy_evaluations_outcome"),
     )
+
+
+class ExecutionIntent(Base):
+    """Candidate ticket audit; all rows are explicitly disabled, never orders."""
+
+    __tablename__ = "execution_intents"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    event_id: Mapped[str] = mapped_column(ForeignKey("events.id", ondelete="RESTRICT"), nullable=False)
+    market_id: Mapped[str] = mapped_column(ForeignKey("markets.id", ondelete="RESTRICT"), nullable=False)
+    strategy_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    outcome_key: Mapped[str] = mapped_column(String(20), nullable=False)
+    contract_side: Mapped[str] = mapped_column(String(8), nullable=False)
+    ask_price: Mapped[Decimal] = mapped_column(Numeric(12, 8), nullable=False)
+    size_usd: Mapped[Decimal] = mapped_column(Numeric(12, 4), nullable=False)
+    max_slippage_bps: Mapped[Decimal] = mapped_column(Numeric(8, 2), nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="disabled")
+    disabled_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    dedupe_key: Mapped[str] = mapped_column(String(300), nullable=False, unique=True)
+
+    __table_args__ = (
+        Index("ix_execution_intents_event_time", "event_id", "observed_at"),
+        CheckConstraint("outcome_key IN ('HOME', 'DRAW', 'AWAY')", name="ck_execution_intents_outcome"),
+        CheckConstraint("contract_side = 'YES'", name="ck_execution_intents_contract_side"),
+        CheckConstraint("ask_price > 0 AND ask_price <= 1", name="ck_execution_intents_price"),
+        CheckConstraint("size_usd >= 5", name="ck_execution_intents_minimum_size"),
+        CheckConstraint("max_slippage_bps > 0 AND max_slippage_bps <= 50", name="ck_execution_intents_slippage"),
+        CheckConstraint("status = 'disabled'", name="ck_execution_intents_disabled_only"),
+    )
+
+
+class WatchlistItem(Base):
+    """Persistent pin for an upcoming Jupiter event; it does not start monitoring."""
+
+    __tablename__ = "watchlist_items"
+
+    event_id: Mapped[str] = mapped_column(
+        ForeignKey("events.id", ondelete="CASCADE"), primary_key=True,
+    )
+    pinned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class MatchSnapshot(Base):

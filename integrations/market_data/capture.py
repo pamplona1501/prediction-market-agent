@@ -10,8 +10,10 @@ from sqlalchemy.orm import Session
 
 from database.connection import get_engine
 from database.strategy_log import record_strategy_evaluations
+from database.execution_intents import record_execution_intents
 from database.snapshots import record_jupiter_market_snapshots
 from integrations.market_data.jupiter import JupiterEvent, JupiterLiveScore, JupiterPredictionClient
+from engine.execution.jupiter_broker import ExecutionTicket
 
 
 @dataclass(frozen=True)
@@ -73,6 +75,23 @@ def persist_strategy_audit(
                 jupiter_event_id=event_id,
                 evaluations=evaluations,
                 input_snapshot=input_snapshot,
+            )
+        return True, count
+    except (SQLAlchemyError, RuntimeError, ValueError):
+        return False, 0
+
+
+def persist_execution_intents(
+    event_id: str,
+    tickets: list[ExecutionTicket],
+) -> tuple[bool, int]:
+    """Persist disabled candidate intents without propagating database details."""
+    try:
+        with Session(get_engine()) as session, session.begin():
+            count = record_execution_intents(
+                session,
+                jupiter_event_id=event_id,
+                tickets=tickets,
             )
         return True, count
     except (SQLAlchemyError, RuntimeError, ValueError):

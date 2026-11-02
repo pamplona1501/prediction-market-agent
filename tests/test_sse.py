@@ -64,3 +64,27 @@ def test_sse_endpoint_streams_initial_snapshot_and_unregisters_client():
             line = next(response.iter_lines())
             assert json.loads(line[6:]) == {"service": {"status": "running"}, "marker": "initial"}
     assert monitor.unregistered
+
+
+def test_watchlist_routes_pin_and_remove_without_starting_monitoring():
+    class FakeMonitor:
+        state = {"events": [], "watchlist": []}
+        monitored = False
+
+        async def start(self): pass
+        async def stop(self): pass
+        def snapshot(self): return self.state
+        async def watch_event(self, event_id):
+            self.state = {**self.state, "watchlist": [{"event_id": event_id}]}
+        async def unwatch_event(self, event_id):
+            self.state = {**self.state, "watchlist": []}
+
+    monitor = FakeMonitor()
+    with TestClient(create_app(monitor)) as client:
+        response = client.post("/api/watchlist/jupiter%3Aevent-1")
+        assert response.status_code == 200
+        assert response.json()["watchlist"] == [{"event_id": "jupiter:event-1"}]
+        assert monitor.monitored is False
+        response = client.delete("/api/watchlist/jupiter%3Aevent-1")
+        assert response.status_code == 200
+        assert response.json()["watchlist"] == []
